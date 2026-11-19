@@ -89,14 +89,18 @@ public struct SettingsHomeView: View {
 
             // 3. Filtros de Oferta
             Section {
-                SliderRow(
-                    title: "Tarifa mínima da corrida",
-                    valueText: Fmt.brl(config.minFareBRL),
-                    value: $config.minFareBRL,
-                    range: 5.0...40.0,
-                    step: 0.50,
-                    tint: .blue
-                )
+                Toggle("Exigir valor mínimo da corrida", isOn: $config.enableMinFareFilter)
+
+                if config.enableMinFareFilter {
+                    SliderRow(
+                        title: "Tarifa mínima da corrida",
+                        valueText: Fmt.brl(config.minFareBRL),
+                        value: $config.minFareBRL,
+                        range: 4.0...30.0,
+                        step: 0.50,
+                        tint: .blue
+                    )
+                }
 
                 SliderRow(
                     title: "Distância máxima p/ buscar",
@@ -109,7 +113,11 @@ public struct SettingsHomeView: View {
             } header: {
                 Text("Filtros de Oferta")
             } footer: {
-                Text("Ofertas abaixo da tarifa mínima ou com busca muito longe recebem alerta de recusa automaticamente.")
+                if config.enableMinFareFilter {
+                    Text("Com o filtro ligado, corridas abaixo de \(Fmt.brl(config.minFareBRL)) recebem alerta de recusa mesmo se pagarem bem por km.")
+                } else {
+                    Text("Filtro de valor mínimo desligado: qualquer corrida rápida que pague bem por km e por hora (mesmo de R$ 6 a R$ 8) receberá sinal VERDE.")
+                }
             }
 
             // 4. Veículo e Combustível

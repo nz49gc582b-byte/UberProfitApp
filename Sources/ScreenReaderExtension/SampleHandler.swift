@@ -52,6 +52,11 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         pattern: #"(?<!\+)(?:R\s*\$|RS)\s*(\d{1,3}(?:[.,]\d{2}))(?!\s*/)"#,
         options: [.caseInsensitive]
     )
+    // Captura exata do botão da 99 Negocia: "Aceitar por R$ 8,14"
+    private static let acceptButtonPriceRegex = try! NSRegularExpression(
+        pattern: #"Aceitar\s+por\s+(?:R\s*\$|RS)\s*(\d{1,3}(?:[.,]\d{2}))"#,
+        options: [.caseInsensitive]
+    )
     // Formato Uber e 99 Pop tradicional: "3 min (0.8 km)" ou "8 min (3,2 km)"
     private static let stepOutsideParenRegex = try! NSRegularExpression(
         pattern: #"(?:(\d{1,2})\s*h(?:oras?)?\s*)?(\d{1,3})\s*min(?:utos?)?\s*\(\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(km|m)\s*\)"#,
@@ -124,9 +129,9 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .fast
         request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.011
-        // Lê a tela inteira verticalmente (0.04 a 0.90) para detectar se estamos dentro do próprio app UberProfit ou tela de Histórico
-        request.regionOfInterest = CGRect(x: 0.0, y: 0.04, width: 1.0, height: 0.86)
+        request.minimumTextHeight = 0.010
+        // Lê a tela inteira desde o rodapé (y: 0.0) até 95% para nunca cortar endereços ou o 2º passo no final da tela
+        request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 0.95)
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
         do {
@@ -149,10 +154,10 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             return
         }
 
-        // Filtra apenas as linhas dos 68% inferiores da tela (onde ficam os cards de corrida) e ignora o próprio PiP
+        // Filtra apenas as linhas dos 75% inferiores da tela (onde ficam os cards de corrida) e ignora o próprio PiP
         var cardLines: [RecognizedLine] = []
         for obs in sortedObservations {
-            guard obs.boundingBox.midY <= 0.68,
+            guard obs.boundingBox.midY <= 0.75,
                   let candidate = obs.topCandidates(1).first else { continue }
             let clean = candidate.string.replacingOccurrences(of: "\u{00A0}", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty, !isSelfOverlayLine(clean) else { continue }
@@ -357,9 +362,11 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         // 2. Extrai Distâncias e Tempos exigindo formato estruturado de card de oferta
         let (pickupKm, tripKm, totalKm, pickupMin, tripMin, totalMin, stepCount) = extractStructuredSteps(from: fullText)
 
-        // Se estiver na gaveta recolhida "Solicitações / Buscando" da 99 e a segunda linha estiver cortada (stepCount < 2),
-        // ignora até o motorista abrir o card completo para NUNCA calcular só 1 km (R$ 9,44/km falso)!
-        if isCollapsed99Drawer && stepCount < 2 {
+        // REGRA DE SEGURANÇA 99:
+        // Na 99, TODO card de corrida possui 2 passos obrigatórios (busca do passageiro + viagem até o destino).
+        // Se stepCount < 2 na 99, a tela ainda está abrindo ou o destino está cortado.
+        // NUNCA aceitar com apenas 1 passo na 99 para evitar os falsos 0,4 km / 2,1 km e distorção de R$/km!
+        if is99Card && stepCount < 2 {
             return nil
         }
 
@@ -382,10 +389,24 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     }
 
     private func extractMainFareBRL(from lines: [RecognizedLine]) -> Double? {
-        var candidates: [(value: Double, height: CGFloat)] = []
+        let fullJoined = lines.map(\.text).joined(separator: "\n")
+        let fullNsRange = NSRange(fullJoined.startIndex..<fullJoined.endIndex, in: fullJoined)
+
+        // 1. Se for 99 Negocia com o botão "Aceitar por R$ 8,14", essa é 100% a tarifa oficial da oferta!
+        if let match = Self.acceptButtonPriceRegex.firstMatch(in: fullJoined, options: [], range: fullNsRange),
+           match.numberOfRanges > 1,
+           let range = Range(match.range(at: 1), in: fullJoined) {
+            let rawValue = fullJoined[range].replacingOccurrences(of: ",", with: ".")
+            if let value = Double(rawValue), value >= 4.5, value <= 950.0 {
+                return value
+            }
+        }
+
+        var candidates: [(value: Double, height: CGFloat, midY: CGFloat)] = []
 
         for line in lines {
             let lower = line.text.lowercased()
+            // Ignora linhas secundárias, taxas extras e detalhes
             if lower.contains("incluíd") ||
                lower.contains("incluid") ||
                lower.contains("incl.") ||
@@ -410,16 +431,25 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                       let range = Range(match.range(at: 1), in: line.text) else { continue }
                 let rawValue = line.text[range].replacingOccurrences(of: ",", with: ".")
                 if let value = Double(rawValue), value >= 4.5, value <= 950.0 {
-                    candidates.append((value: value, height: line.height))
+                    candidates.append((value: value, height: line.height, midY: line.midY))
                 }
             }
         }
 
         guard !candidates.isEmpty else { return nil }
 
+        // Na Uber e 99, a tarifa principal tem a maior altura de fonte (título gigante do card)
+        // e fica na parte superior do card (maior midY entre as linhas do card)
         let maxHeight = candidates.map(\.height).max() ?? 0
-        let prominent = candidates.filter { $0.height >= maxHeight * 0.65 }
-        return prominent.map(\.value).max() ?? candidates.map(\.value).max()
+        let prominent = candidates.filter { $0.height >= maxHeight * 0.70 }
+
+        // Se houver múltiplas (ex: 99 Negocia com várias opções no rodapé),
+        // a tarifa principal da oferta é a que fica MAIS ACIMA no card (maior midY)
+        if let topProminent = prominent.max(by: { $0.midY < $1.midY }) {
+            return topProminent.value
+        }
+
+        return candidates.max(by: { $0.height < $1.height })?.value
     }
 
     private func extractStructuredSteps(from fullText: String) -> (Double, Double, Double, Int, Int, Int, Int) {

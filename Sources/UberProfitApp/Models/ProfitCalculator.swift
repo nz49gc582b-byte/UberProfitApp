@@ -167,6 +167,7 @@ public struct RideAnalysis: Identifiable, Codable, Sendable, Equatable {
 public struct DriverSettings: Sendable, Equatable {
     public var targetBRLPerKm: Double
     public var targetBRLPerHour: Double
+    public var enableMinFareFilter: Bool
     public var minFareBRL: Double
     public var maxPickupDistanceKm: Double
     public var carConsumptionKmPerLiter: Double
@@ -180,7 +181,8 @@ public struct DriverSettings: Sendable, Equatable {
     public init(
         targetBRLPerKm: Double = 2.00,
         targetBRLPerHour: Double = 40.00,
-        minFareBRL: Double = 10.0,
+        enableMinFareFilter: Bool = false,
+        minFareBRL: Double = 0.0,
         maxPickupDistanceKm: Double = 3.0,
         carConsumptionKmPerLiter: Double = 10.0,
         fuelPriceBRLPerLiter: Double = 6.35,
@@ -192,6 +194,7 @@ public struct DriverSettings: Sendable, Equatable {
     ) {
         self.targetBRLPerKm = targetBRLPerKm
         self.targetBRLPerHour = targetBRLPerHour
+        self.enableMinFareFilter = enableMinFareFilter
         self.minFareBRL = minFareBRL
         self.maxPickupDistanceKm = maxPickupDistanceKm
         self.carConsumptionKmPerLiter = carConsumptionKmPerLiter
@@ -229,8 +232,9 @@ public struct ProfitCalculator: Sendable {
         let meetsHourTarget = referencePerHour >= settings.targetBRLPerHour
         
         // Novos Filtros Inteligentes
-        let passesMinFare = offer.fareBRL >= settings.minFareBRL
-        let passesPickupDist = offer.pickupDistanceKm <= settings.maxPickupDistanceKm
+        // Se enableMinFareFilter for falso ou minFareBRL for <= 0, qualquer valor de corrida (mesmo R$ 6,00) que pague bem por km e hora dá VERDE!
+        let passesMinFare = !settings.enableMinFareFilter || settings.minFareBRL <= 0 || offer.fareBRL >= settings.minFareBRL
+        let passesPickupDist = settings.maxPickupDistanceKm <= 0 || offer.pickupDistanceKm <= settings.maxPickupDistanceKm
 
         let verdict: RideVerdict
         if meetsKmTarget && meetsHourTarget && passesMinFare && passesPickupDist {

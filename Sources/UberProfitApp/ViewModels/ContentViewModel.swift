@@ -97,6 +97,7 @@ public final class ContentViewModel: ObservableObject {
         DriverSettings(
             targetBRLPerKm: config.targetBRLPerKm,
             targetBRLPerHour: config.targetBRLPerHour,
+            enableMinFareFilter: config.enableMinFareFilter,
             minFareBRL: config.minFareBRL,
             maxPickupDistanceKm: config.maxPickupDistanceKm,
             carConsumptionKmPerLiter: config.carConsumptionKmPerLiter,
