@@ -69,7 +69,7 @@ public final class NotificationAlertManager: NSObject, ObservableObject, @precon
         }
 
         let request = UNNotificationRequest(
-            identifier: "UBER_PROFIT_LIVE_OFFER",
+            identifier: "UBER_PROFIT_OFFER_\(Int(analysis.offer.timestamp * 1000))",
             content: content,
             trigger: nil
         )

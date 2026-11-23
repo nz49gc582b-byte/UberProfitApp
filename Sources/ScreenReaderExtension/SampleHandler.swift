@@ -187,6 +187,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         lastValidOfferSeenTime = timestamp
         didSendClearCard = false
         didSendAcceptedForLastOffer = false
+        acceptedHitCount = 0
 
         let offerHash = computeOfferHash(fare: payload.fareBRL, totalKm: payload.totalDistanceKm, totalMin: payload.totalMinutes)
         pruneExpiredHashes(now: timestamp)
@@ -208,7 +209,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
 
         let upper = allScreenText.uppercased()
 
-        if elapsed > 22.0 {
+        if elapsed > 30.0 {
+            acceptedHitCount = 0
             didSendAcceptedForLastOffer = true
             sendPingStatus(status: "RIDE_UNKNOWN")
             return
@@ -233,23 +235,42 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         let isAcceptedTripScreen =
             upper.contains("INICIAR VIAGEM") ||
             upper.contains("INICIAR CORRIDA") ||
+            upper.contains("INICIAR UBER") ||
             upper.contains("IR PARA O EMBARQUE") ||
-            upper.contains("A CAMINHO DO") ||
-            upper.contains("CHEGUEI NO LOCAL") ||
-            upper.contains("CHEGUEI AO LOCAL") ||
-            upper.contains("DESLIZE PARA INICIAR") ||
+            upper.contains("ATÉ O EMBARQUE") ||
+            upper.contains("ATE O EMBARQUE") ||
+            upper.contains("LOCAL DE EMBARQUE") ||
+            upper.contains("PONTO DE EMBARQUE") ||
+            upper.contains("EMBARQUE DE ") ||
+            upper.contains("EMBARQUE EM ") ||
+            upper.contains("A CAMINHO D") ||
+            upper.contains("CHEGUEI") ||
+            upper.contains("DESLIZE PARA") ||
             upper.contains("AGUARDANDO PASSAGEIRO") ||
             upper.contains("BUSCAR PASSAGEIRO") ||
+            upper.contains("BUSCANDO PASSAGEIRO") ||
+            upper.contains("PEGAR PASSAGEIRO") ||
+            upper.contains("INDO BUSCAR") ||
+            upper.contains("INDO ATÉ") ||
+            upper.contains("INDO ATE") ||
             upper.contains("ENCONTRAR COM") ||
+            upper.contains("ENCONTRO COM") ||
+            upper.contains("FALAR COM PASSAGEIRO") ||
+            upper.contains("NOTIFICAR PASSAGEIRO") ||
+            upper.contains("LIGAR PARA PASSAGEIRO") ||
+            upper.contains("CORRIDA ACEITA") ||
+            upper.contains("VIAGEM ACEITA") ||
+            upper.contains("CONECTANDO AO PASSAGEIRO") ||
             upper.contains("CANCELAR VIAGEM") ||
             upper.contains("CANCELAR CORRIDA") ||
-            upper.contains("INDO BUSCAR") ||
-            upper.contains("VOCÊ CHEGOU")
+            upper.contains("VOCÊ CHEGOU") ||
+            upper.contains("VOCE CHEGOU")
 
-        // Confirmação em 2 leituras consecutivas (≥0,6s) para evitar falso positivo na troca de apps
+        // Soma confirmações na janela pós-oferta (não zera em frame intermediário de animação do mapa,
+        // mas zera se voltar para a tela ociosa de busca)
         if isAcceptedTripScreen {
             acceptedHitCount += 1
-        } else {
+        } else if isIdleScreen {
             acceptedHitCount = 0
         }
 
@@ -258,7 +279,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             didSendAcceptedForLastOffer = true
             didSendClearCard = true
             sendPingStatus(status: "RIDE_ACCEPTED")
-        } else if isIdleScreen && elapsed >= 2.0 {
+        } else if isIdleScreen && elapsed >= 3.0 {
+            acceptedHitCount = 0
             didSendAcceptedForLastOffer = true
             sendPingStatus(status: "RIDE_DECLINED")
         }
