@@ -146,11 +146,17 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         }
 
         let sortedObservations = observations.sorted { $0.boundingBox.midY > $1.boundingBox.midY }
-        let allScreenText = sortedObservations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+        // Texto da tela SEM as linhas da janela PiP do próprio app (que flutua por cima da Uber/99).
+        // Sem esse filtro, o texto do PiP ("UBER & 99 PROFIT ATIVO") fazia o leitor achar que estava dentro do app e parar de ler.
+        let allScreenText = sortedObservations
+            .compactMap { $0.topCandidates(1).first?.string }
+            .filter { !isSelfOverlayLine($0) }
+            .joined(separator: "\n")
 
         // BLOQUEIO TOTAL SE O MOTORISTA ESTIVER DENTRO DO PRÓPRIO UBERPROFIT OU EM TELAS DE HISTÓRICO/GANHOS!
         if isInsideOwnAppOrHistoryScreen(allScreenText) {
             acceptedHitCount = 0
+            checkAndClearStaleCard(now: timestamp)
             return
         }
 
@@ -269,14 +275,14 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     private func isInsideOwnAppOrHistoryScreen(_ screenText: String) -> Bool {
         let upper = screenText.uppercased()
         // 1. Detecta se a tela aberta é o próprio app Uber & 99 Profit Auto (Painel, Ganhos, Histórico, Ajustes, Console)
-        if upper.contains("UBER & 99 PROFIT") ||
-           upper.contains("UBERPROFIT") ||
+        // ATENÇÃO: nunca colocar aqui textos que aparecem na janela PiP
+        // ("UBER & 99 PROFIT ATIVO", "Monitorando ofertas em tempo real", "LUCRO R$", "Tarifa R$"...).
+        if upper.contains("UBER & 99 PROFIT AUTO") ||
            upper.contains("METAS & CARRO") ||
            upper.contains("METAS DE LUCRATIVIDADE") ||
            upper.contains("FILTROS DE OFERTA") ||
            upper.contains("VEÍCULO E COMBUSTÍVEL") ||
            upper.contains("MONITORAMENTO AO VIVO") ||
-           upper.contains("MONITORANDO OFERTAS") ||
            upper.contains("LEITOR DESLIGADO") ||
            upper.contains("INICIAR LEITOR") ||
            upper.contains("PARAR LEITOR") ||
@@ -319,16 +325,26 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         return false
     }
 
+    /// Linhas desenhadas pela própria janela PiP (card de análise ou card de espera).
+    /// O OCR às vezes troca "." por "," (ex.: "Comb, -R$"), então os padrões são tolerantes.
     private func isSelfOverlayLine(_ line: String) -> Bool {
         let upper = line.uppercased()
         return upper.contains("PROFIT ATIVO") ||
+               upper.contains("UBER & 99 PROFIT") ||
                upper.contains("UBERPROFIT") ||
+               upper.contains("MONITORANDO OFERTAS") ||
+               upper.contains("EM TEMPO REAL") ||
                upper.contains("LUCRO R$") ||
                upper.contains("LUCRO LIVRE:") ||
                upper.contains("COMB. -R$") ||
+               upper.contains("COMB, -R$") ||
+               upper.contains("COMB -R$") ||
                upper.contains("GASOLINA: -R$") ||
                upper.contains("KM TOTAL") ||
-               upper.contains("MONITORANDO OFERTAS") ||
+               upper.contains("TARIFA R$") ||
+               upper.contains("• ACEITAR •") ||
+               upper.contains("• RECUSAR •") ||
+               upper.contains("• ATENÇÃO •") ||
                upper.contains("[UBER]") ||
                upper.contains("[99]")
     }
