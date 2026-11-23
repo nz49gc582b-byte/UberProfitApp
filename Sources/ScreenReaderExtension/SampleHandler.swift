@@ -28,9 +28,9 @@ private struct RecognizedLine {
 public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
 
     // MARK: - Configurações de Performance e Limites
-    private let throttleInterval: TimeInterval = 0.40
-    private let heartbeatInterval: TimeInterval = 2.0
-    private let debounceInterval: TimeInterval = 25.0 // 25s para não repetir leitura no mesmo card parado
+    private let throttleInterval: TimeInterval = 0.35
+    private let heartbeatInterval: TimeInterval = 1.5
+    private let debounceInterval: TimeInterval = 2.2 // Reenvia a oferta ativa a cada 2.2s para garantir entrega 100% ao PiP em 2º plano
     private let udpHost: NWEndpoint.Host = "127.0.0.1"
     private let udpPort: NWEndpoint.Port = 9876
 
@@ -586,37 +586,48 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         }
     }
 
-    // MARK: - Envio UDP Local (127.0.0.1:9876)
+    // MARK: - Envio UDP Local (127.0.0.1:9876) com Auto-Reconexão
     private func setupUDPConnection() {
         udpConnection?.cancel()
         let connection = NWConnection(host: udpHost, port: udpPort, using: .udp)
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.udpConnection = nil
+            default:
+                break
+            }
+        }
         connection.start(queue: processingQueue)
         self.udpConnection = connection
     }
 
-    private func sendOfferViaUDP(_ payload: RideOfferPayload) {
-        guard let data = try? JSONEncoder().encode(payload) else { return }
+    private func sendRawUDP(_ data: Data) {
         if udpConnection == nil {
             setupUDPConnection()
         }
-        udpConnection?.send(content: data, completion: .contentProcessed({ _ in }))
+        udpConnection?.send(content: data, completion: .contentProcessed({ [weak self] error in
+            if error != nil {
+                self?.setupUDPConnection()
+                self?.udpConnection?.send(content: data, completion: .contentProcessed({ _ in }))
+            }
+        }))
+    }
+
+    private func sendOfferViaUDP(_ payload: RideOfferPayload) {
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        sendRawUDP(data)
     }
 
     private func sendTextStatus(status: String, text: String) {
         let packet: [String: String] = ["status": status, "text": text]
         guard let data = try? JSONSerialization.data(withJSONObject: packet, options: []) else { return }
-        if udpConnection == nil {
-            setupUDPConnection()
-        }
-        udpConnection?.send(content: data, completion: .contentProcessed({ _ in }))
+        sendRawUDP(data)
     }
 
     private func sendPingStatus(status: String) {
         let packet: [String: String] = ["status": status]
         guard let data = try? JSONSerialization.data(withJSONObject: packet, options: []) else { return }
-        if udpConnection == nil {
-            setupUDPConnection()
-        }
-        udpConnection?.send(content: data, completion: .contentProcessed({ _ in }))
+        sendRawUDP(data)
     }
 }

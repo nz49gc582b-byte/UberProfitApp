@@ -50,6 +50,8 @@ public final class ContentViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var didStartServices = false
     private let maxHistoryItems = 300
+    private var lastAnnouncedSignature: String = ""
+    private var lastAnnouncedTime: TimeInterval = 0
 
     public init() {
         self.history = persistence.loadHistory()
@@ -64,6 +66,12 @@ public final class ContentViewModel: ObservableObject {
             .store(in: &cancellables)
 
         keepAlive.objectWillChange
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.objectWillChange.send() }
+            }
+            .store(in: &cancellables)
+
+        pipManager.objectWillChange
             .sink { [weak self] _ in
                 Task { @MainActor in self?.objectWillChange.send() }
             }
@@ -147,6 +155,12 @@ public final class ContentViewModel: ObservableObject {
             }
         }
 
+        udpListener.onHeartbeatReceived = { [weak self] in
+            Task { @MainActor in
+                self?.keepAlive.ensureEnginePlaying()
+            }
+        }
+
         udpListener.onOfferReceived = { [weak self] offer in
             Task { @MainActor in
                 self?.processIncomingOffer(offer, recordInHistory: true)
@@ -208,6 +222,19 @@ public final class ContentViewModel: ObservableObject {
         self.latestAnalysis = analysis
         self.lastSeenAnalysis = analysis
 
+        // Atualiza sempre o PiP em tempo real (com flush + invalidatePlaybackState)
+        self.pipManager.updateCard(with: analysis, displayMode: self.config.primaryMetricDisplay)
+
+        let sig = "\(offer.appSource)-\(Int((offer.fareBRL * 100).rounded()))-\(Int((offer.totalDistanceKm * 10).rounded()))-\(offer.totalMinutes)"
+        let isRepeatedSameCard = recordInHistory && (sig == lastAnnouncedSignature) && ((offer.timestamp - lastAnnouncedTime) < 18.0)
+
+        guard !isRepeatedSameCard else { return }
+
+        if recordInHistory {
+            lastAnnouncedSignature = sig
+            lastAnnouncedTime = offer.timestamp
+        }
+
         let origin = recordInHistory ? "" : " (simulação)"
         addLog(
             "Oferta\(origin) [\(offer.appSource)] \(Fmt.brl(offer.fareBRL)) · \(Fmt.km(offer.totalDistanceKm)) · \(offer.totalMinutes) min → \(analysis.verdict.rawValue) (\(Fmt.perKm(analysis.grossPerKm)))",
@@ -222,11 +249,8 @@ public final class ContentViewModel: ObservableObject {
             self.persistence.saveHistory(self.history)
         }
 
-        self.pipManager.updateCard(with: analysis, displayMode: self.config.primaryMetricDisplay)
-
-        if self.config.visualAlertMode == .notificationOnly || self.config.visualAlertMode == .both {
-            self.notificationManager.sendRideBanner(analysis: analysis, displayMode: self.config.primaryMetricDisplay)
-        }
+        // Dispara sempre o banner de notificação no topo (mesmo com PiP ativo)
+        self.notificationManager.sendRideBanner(analysis: analysis, displayMode: self.config.primaryMetricDisplay)
 
         if self.config.voiceAlertsEnabled {
             self.voiceManager.announce(analysis: analysis, settings: settings)

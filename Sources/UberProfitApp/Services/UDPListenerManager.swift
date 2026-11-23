@@ -2,8 +2,8 @@ import Foundation
 import Network
 import UIKit
 
-/// Gerencia o socket UDP local (`127.0.0.1:9876`) e monitora em tempo real (`UIScreen.main.isCaptured` + Heartbeat UDP)
-/// se a transmissão de tela do ReplayKit está ativa para atualizar imediatamente o botão na interface.
+/// Gerencia o socket UDP local (`127.0.0.1:9876`) com auto-recuperação automática em 2º plano
+/// e monitora em tempo real (`UIScreen.main.isCaptured` + Heartbeat UDP) se a transmissão do ReplayKit está ativa.
 @MainActor
 public final class UDPListenerManager: ObservableObject {
     @Published public private(set) var isListening: Bool = false
@@ -15,6 +15,7 @@ public final class UDPListenerManager: ObservableObject {
     public var onRideAcceptedDetected: (@Sendable () -> Void)?
     /// kind: "DECLINED" | "UNKNOWN" | "SNAPSHOT"
     public var onRideOutcome: (@Sendable (String, String) -> Void)?
+    public var onHeartbeatReceived: (@Sendable () -> Void)?
 
     private var listener: NWListener?
     private var screenCheckTimer: Timer?
@@ -43,7 +44,13 @@ public final class UDPListenerManager: ObservableObject {
                         self.isListening = true
                     case .failed, .cancelled:
                         self.isListening = false
+                        self.listener?.cancel()
                         self.listener = nil
+                        // Auto-reconexão automática após queda de socket em 2º plano
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 400_000_000)
+                            self?.startListening()
+                        }
                     default:
                         break
                     }
@@ -57,8 +64,10 @@ public final class UDPListenerManager: ObservableObject {
 
             nwListener.start(queue: listenerQueue)
             self.listener = nwListener
+            self.isListening = true
         } catch {
             self.isListening = false
+            self.listener = nil
         }
     }
 
@@ -69,7 +78,9 @@ public final class UDPListenerManager: ObservableObject {
     }
 
     private func setupScreenCaptureObserver() {
-        NotificationCenter.default.addObserver(
+        let nc = NotificationCenter.default
+
+        nc.addObserver(
             forName: UIScreen.capturedDidChangeNotification,
             object: nil,
             queue: .main
@@ -79,9 +90,40 @@ public final class UDPListenerManager: ObservableObject {
             }
         }
 
+        nc.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if !self.isListening || self.listener == nil {
+                    self.startListening()
+                }
+            }
+        }
+
+        nc.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if !self.isListening || self.listener == nil {
+                    self.startListening()
+                }
+                self.updateScreenCaptureStatus()
+            }
+        }
+
         let timer = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.updateScreenCaptureStatus()
+                guard let self else { return }
+                if !self.isListening || self.listener == nil {
+                    self.startListening()
+                }
+                self.updateScreenCaptureStatus()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -113,6 +155,7 @@ public final class UDPListenerManager: ObservableObject {
                 guard let self else { return }
                 self.lastPacketTime = Date()
                 self.broadcastActive = true
+                self.onHeartbeatReceived?()
                 self.onOfferReceived?(offer)
             }
             return
@@ -122,6 +165,7 @@ public final class UDPListenerManager: ObservableObject {
            let status = statusDict["status"] {
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.onHeartbeatReceived?()
                 if status == "BROADCAST_FINISHED" {
                     self.lastPacketTime = nil
                     self.broadcastActive = UIScreen.main.isCaptured

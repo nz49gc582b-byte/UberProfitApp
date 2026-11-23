@@ -94,19 +94,23 @@ public final class PiPOverlayManager: NSObject, ObservableObject, @preconcurrenc
     }
 
     public func updateCard(with analysis: RideAnalysis?, displayMode: PrimaryMetricDisplay = .gross) {
-        guard currentAnalysis != analysis || currentDisplayMode != displayMode else { return }
         self.currentAnalysis = analysis
         self.currentDisplayMode = displayMode
         rebuildCachedPixelBuffer(for: analysis, displayMode: displayMode)
+        displayLayer.flush()
         enqueueCachedFrame()
+        enqueueCachedFrame()
+        pipController?.invalidatePlaybackState()
     }
 
     private func startFrameFeedTimer() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.enqueueCachedFrame()
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
     }
 
     private func rebuildCachedPixelBuffer(for analysis: RideAnalysis?, displayMode: PrimaryMetricDisplay) {
