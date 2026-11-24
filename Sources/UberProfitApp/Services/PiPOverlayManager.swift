@@ -21,6 +21,7 @@ public final class PiPOverlayManager: NSObject, ObservableObject, @preconcurrenc
     private var currentDisplayMode: PrimaryMetricDisplay = .gross
     private var cachedPixelBuffer: CVPixelBuffer?
     private var statusObservation: NSKeyValueObservation?
+    private var confirmationExpireDate: Date?
 
     private let canvasSize = CGSize(width: 640, height: 260)
 
@@ -94,6 +95,13 @@ public final class PiPOverlayManager: NSObject, ObservableObject, @preconcurrenc
     }
 
     public func updateCard(with analysis: RideAnalysis?, displayMode: PrimaryMetricDisplay = .gross) {
+        // Se uma confirmação de "CORRIDA SALVA NOS GANHOS" está ativa na tela, não deixa um CLEAR_CARD (nil) apagá-la antes dos 4s
+        if analysis == nil, let expire = confirmationExpireDate, Date() < expire {
+            return
+        }
+        if analysis != nil {
+            confirmationExpireDate = nil
+        }
         self.currentAnalysis = analysis
         self.currentDisplayMode = displayMode
         rebuildCachedPixelBuffer(for: analysis, displayMode: displayMode)
@@ -101,6 +109,32 @@ public final class PiPOverlayManager: NSObject, ObservableObject, @preconcurrenc
         enqueueCachedFrame()
         enqueueCachedFrame()
         pipController?.invalidatePlaybackState()
+    }
+
+    /// Exibe por 4,5 segundos na janela PiP a confirmação verde de que a corrida foi registrada automaticamente nos Ganhos
+    public func showAcceptedConfirmation(for analysis: RideAnalysis) {
+        self.currentAnalysis = nil
+        self.confirmationExpireDate = Date().addingTimeInterval(4.5)
+        let image = renderAcceptedConfirmationImage(for: analysis)
+        self.cachedPixelBuffer = createPixelBuffer(from: image)
+        displayLayer.flush()
+        enqueueCachedFrame()
+        enqueueCachedFrame()
+        pipController?.invalidatePlaybackState()
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 4_500_000_000)
+            guard let self else { return }
+            if let expire = self.confirmationExpireDate, Date() >= expire.addingTimeInterval(-0.2) {
+                self.confirmationExpireDate = nil
+                if self.currentAnalysis == nil {
+                    self.rebuildCachedPixelBuffer(for: nil, displayMode: self.currentDisplayMode)
+                    self.displayLayer.flush()
+                    self.enqueueCachedFrame()
+                    self.pipController?.invalidatePlaybackState()
+                }
+            }
+        }
     }
 
     private func startFrameFeedTimer() {
@@ -224,6 +258,53 @@ public final class PiPOverlayManager: NSObject, ObservableObject, @preconcurrenc
 
             drawText(
                 footerString,
+                in: CGRect(x: 16, y: 192, width: canvasSize.width - 32, height: 45),
+                font: .systemFont(ofSize: 22, weight: .bold),
+                color: UIColor.white.withAlphaComponent(0.95),
+                alignment: .center
+            )
+        }
+    }
+
+    private func renderAcceptedConfirmationImage(for analysis: RideAnalysis) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: canvasSize)
+        return renderer.image { context in
+            let rect = CGRect(origin: .zero, size: canvasSize)
+            UIColor(red: 0.04, green: 0.54, blue: 0.28, alpha: 1.0).setFill()
+            context.fill(rect)
+
+            let headerRect = CGRect(x: 16, y: 14, width: canvasSize.width - 32, height: 48)
+            let headerPath = UIBezierPath(roundedRect: headerRect, cornerRadius: 12)
+            UIColor.black.withAlphaComponent(0.28).setFill()
+            headerPath.fill()
+
+            drawText(
+                "CORRIDA SALVA NOS GANHOS",
+                in: CGRect(x: 20, y: 20, width: canvasSize.width - 40, height: 38),
+                font: .systemFont(ofSize: 26, weight: .heavy),
+                color: .white,
+                alignment: .center
+            )
+
+            let netStr = String(format: "+R$ %.2f LIVRE", analysis.netProfitBRL).replacingOccurrences(of: ".", with: ",")
+            drawText(
+                netStr,
+                in: CGRect(x: 20, y: 80, width: canvasSize.width - 40, height: 85),
+                font: .systemFont(ofSize: 52, weight: .black),
+                color: .white,
+                alignment: .center
+            )
+
+            let footer = String(
+                format: "[%@] Tarifa R$ %.2f  •  %.1f km  •  %d min",
+                analysis.offer.appSource,
+                analysis.offer.fareBRL,
+                analysis.offer.totalDistanceKm,
+                analysis.offer.totalMinutes
+            ).replacingOccurrences(of: ".", with: ",")
+
+            drawText(
+                footer,
                 in: CGRect(x: 16, y: 192, width: canvasSize.width - 32, height: 45),
                 font: .systemFont(ofSize: 22, weight: .bold),
                 color: UIColor.white.withAlphaComponent(0.95),

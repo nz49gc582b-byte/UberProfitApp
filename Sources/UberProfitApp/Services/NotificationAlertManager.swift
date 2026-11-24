@@ -77,6 +77,29 @@ public final class NotificationAlertManager: NSObject, ObservableObject, @precon
         center.add(request, withCompletionHandler: nil)
     }
 
+    public func sendRideAcceptedBanner(analysis: RideAnalysis) {
+        let center = UNUserNotificationCenter.current()
+        let content = UNMutableNotificationContent()
+        let netStr = String(format: "R$ %.2f", analysis.netProfitBRL).replacingOccurrences(of: ".", with: ",")
+        let fareStr = String(format: "R$ %.2f", analysis.offer.fareBRL).replacingOccurrences(of: ".", with: ",")
+        let distStr = String(format: "%.1f km", analysis.offer.totalDistanceKm).replacingOccurrences(of: ".", with: ",")
+
+        content.title = "✅ Corrida Salva nos Ganhos! (\(analysis.offer.appSource))"
+        content.subtitle = "Lucro Livre: +\(netStr)"
+        content.body = "Tarifa: \(fareStr) • \(distStr) • \(analysis.offer.totalMinutes) min"
+        content.sound = .default
+        if #available(iOS 15.0, *) {
+            content.interruptionLevel = .timeSensitive
+        }
+
+        let request = UNNotificationRequest(
+            identifier: "UBER_PROFIT_ACCEPTED_\(Int(Date().timeIntervalSince1970 * 1000))",
+            content: content,
+            trigger: nil
+        )
+        center.add(request, withCompletionHandler: nil)
+    }
+
     public func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,

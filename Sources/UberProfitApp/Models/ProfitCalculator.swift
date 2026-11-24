@@ -57,6 +57,13 @@ public struct RideOfferPayload: Codable, Sendable, Equatable {
     }
 }
 
+/// Evento de corrida aceita enviado via UDP pela extensão com o payload completo da oferta
+public struct AcceptedRideEventPayload: Codable, Sendable, Equatable {
+    public let status: String
+    public let triggerReason: String
+    public let offer: RideOfferPayload
+}
+
 /// Modo de exibição visual escolhido pelo motorista
 public enum VisualAlertMode: String, CaseIterable, Sendable {
     case notificationOnly = "NOTIFICATION"
@@ -160,6 +167,16 @@ public struct RideAnalysis: Identifiable, Codable, Sendable, Equatable {
         self.netPerKm = netPerKm
         self.netPerHour = netPerHour
         self.verdict = verdict
+    }
+
+    /// Compara se duas análises correspondem ao mesmo card de corrida (mesmo app, tarifa, km e dentro de 90s)
+    public func isSameOffer(as other: RideAnalysis) -> Bool {
+        if self.id == other.id { return true }
+        return self.offer.appSource == other.offer.appSource &&
+               abs(self.offer.fareBRL - other.offer.fareBRL) < 0.01 &&
+               abs(self.offer.totalDistanceKm - other.offer.totalDistanceKm) < 0.15 &&
+               self.offer.totalMinutes == other.offer.totalMinutes &&
+               abs(self.offer.timestamp - other.offer.timestamp) < 90.0
     }
 }
 

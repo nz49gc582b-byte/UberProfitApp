@@ -175,12 +175,31 @@ public final class ContentViewModel: ObservableObject {
             }
         }
 
+        udpListener.onRideAcceptedWithOffer = { [weak self] offer, reason in
+            Task { @MainActor in
+                guard let self = self else { return }
+                guard self.config.autoDetectAcceptedRides else {
+                    self.addLog("Registro automático desligado nos Ajustes: corrida não registrada.", kind: .unknown)
+                    return
+                }
+                let analysis = ProfitCalculator.evaluate(offer: offer, settings: self.currentSettings)
+                self.lastSeenAnalysis = analysis
+                if !self.history.contains(where: { $0.isSameOffer(as: analysis) }) {
+                    self.history.insert(analysis, at: 0)
+                    if self.history.count > self.maxHistoryItems {
+                        self.history.removeLast(self.history.count - self.maxHistoryItems)
+                    }
+                    self.persistence.saveHistory(self.history)
+                }
+                self.acceptRide(analysis, source: "automático • \(reason)", showFeedback: true)
+            }
+        }
+
         udpListener.onRideAcceptedDetected = { [weak self] in
             Task { @MainActor in
                 guard let self = self else { return }
-                self.addLog("RIDE_ACCEPTED recebido da extensão.", kind: .accepted)
                 if self.config.autoDetectAcceptedRides, let candidate = self.latestAnalysis ?? self.lastSeenAnalysis {
-                    self.acceptRide(candidate, source: "automático")
+                    self.acceptRide(candidate, source: "automático", showFeedback: true)
                 } else if !self.config.autoDetectAcceptedRides {
                     self.addLog("Registro automático desligado nos Ajustes: corrida não registrada.", kind: .unknown)
                 } else {
@@ -276,10 +295,15 @@ public final class ContentViewModel: ObservableObject {
     // MARK: - Turno atual (Ganhos)
 
     @discardableResult
-    public func acceptRide(_ ride: RideAnalysis, source: String = "manual") -> Bool {
-        guard !acceptedRides.contains(where: { $0.id == ride.id }) else { return false }
+    public func acceptRide(_ ride: RideAnalysis, source: String = "manual", showFeedback: Bool = false) -> Bool {
+        guard !acceptedRides.contains(where: { $0.isSameOffer(as: ride) }) else { return false }
         acceptedRides.append(ride)
         persistence.saveAcceptedRides(acceptedRides)
+        latestAnalysis = nil
+        pipManager.showAcceptedConfirmation(for: ride)
+        if showFeedback {
+            notificationManager.sendRideAcceptedBanner(analysis: ride)
+        }
         addLog(
             "Corrida registrada (\(source)): [\(ride.offer.appSource)] \(Fmt.brl(ride.offer.fareBRL)) · lucro \(Fmt.brl(ride.netProfitBRL))",
             kind: .accepted
@@ -294,7 +318,7 @@ public final class ContentViewModel: ObservableObject {
     }
 
     public func isRideAlreadyAccepted(_ ride: RideAnalysis) -> Bool {
-        acceptedRides.contains(where: { $0.id == ride.id })
+        acceptedRides.contains(where: { $0.isSameOffer(as: ride) })
     }
 
     public func finishTurn(reason: String = "Manual") {
