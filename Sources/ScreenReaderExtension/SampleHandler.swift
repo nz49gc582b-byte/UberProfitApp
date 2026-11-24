@@ -60,6 +60,12 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     private var activeOfferHash: Int = 0
     private var activeOfferPickupStreet: String = ""
 
+    // Controle de "Corrida Encaixada" (quando o motorista JÁ está em uma corrida e toca outra perto do destino)
+    private var isDriverCurrentlyOnTrip: Bool = false
+    private var wasInActiveTripWhenOfferArrived: Bool = false
+    private var didFinishPreviousTripAfterOffer: Bool = false
+    private var preOfferScreenSnapshot: String = ""
+
     private var udpConnection: NWConnection?
     private let processingQueue = DispatchQueue(label: "com.uberprofit.screenreader.vision", qos: .userInteractive)
 
@@ -126,7 +132,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         }
 
         let wallNow = Date().timeIntervalSince1970
-        let isPendingAcceptCheck = !didSendAcceptedForLastOffer && lastValidOfferSeenTime > 0 && ((wallNow - lastValidOfferSeenTime) <= 35.0)
+        let pendingTimeout: TimeInterval = wasInActiveTripWhenOfferArrived ? 240.0 : 35.0
+        let isPendingAcceptCheck = !didSendAcceptedForLastOffer && lastValidOfferSeenTime > 0 && ((wallNow - lastValidOfferSeenTime) <= pendingTimeout)
         let activeThrottle = isPendingAcceptCheck ? fastPostOfferThrottleInterval : normalThrottleInterval
 
         guard (now - lastProcessedTime) >= activeThrottle, !isProcessingFrame else {
@@ -233,6 +240,20 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             effectivePayload = parsedPayload
             activeOfferHash = offerHash
             activeOfferPickupStreet = extractPickupStreetToken(from: cardLines)
+
+            let normAll = Self.stripDiacritics(allScreenText.uppercased())
+            let hasTopNavWhileCardOpen =
+                normAll.contains("PROXIMA CORRIDA") ||
+                normAll.contains("PROXIMA VIAGEM") ||
+                normAll.contains("VIAGEM ATUAL") ||
+                normAll.contains("CORRIDA ATUAL") ||
+                normAll.contains("VIRE A DIREITA") ||
+                normAll.contains("VIRE A ESQUERDA") ||
+                normAll.contains("SIGA EM FRENTE") ||
+                normAll.contains("SIGA PELA")
+
+            wasInActiveTripWhenOfferArrived = isDriverCurrentlyOnTrip || hasTopNavWhileCardOpen
+            didFinishPreviousTripAfterOffer = false
         }
 
         activeOfferPayload = effectivePayload
@@ -252,24 +273,37 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         sendOfferViaUDP(effectivePayload)
     }
 
-    // MARK: - Motor Multi-Sinal de Detecção de Corrida Aceita
+    // MARK: - Motor Multi-Sinal de Detecção de Corrida Aceita (Com Proteção de Corrida Encaixada)
     private func checkIfOfferWasAcceptedOnScreen(
         allScreenText: String,
         cleanLines: [String],
         cardLines: [RecognizedLine],
         now: TimeInterval
     ) {
-        guard !didSendAcceptedForLastOffer,
-              let pendingOffer = activeOfferPayload,
-              lastValidOfferSeenTime > 0 else { return }
+        let upper = allScreenText.uppercased()
+        let normalizedUpper = Self.stripDiacritics(upper)
+        let isIdle = isIdleRadarScreen(upper: upper, normalizedUpper: normalizedUpper, cleanLines: cleanLines)
+
+        // Quando não há oferta pendente de confirmação, monitora continuamente se o motorista está livre ou em corrida ativa
+        if didSendAcceptedForLastOffer || activeOfferPayload == nil || lastValidOfferSeenTime <= 0 {
+            if isIdle {
+                isDriverCurrentlyOnTrip = false
+                preOfferScreenSnapshot = ""
+            } else if hasActiveTripOrNavigationIndicators(normalizedUpper) {
+                isDriverCurrentlyOnTrip = true
+                preOfferScreenSnapshot = normalizedUpper
+            }
+            return
+        }
+
+        guard let pendingOffer = activeOfferPayload else { return }
 
         let elapsed = now - lastValidOfferSeenTime
         guard elapsed >= 0.35 else { return }
 
-        let upper = allScreenText.uppercased()
-        let normalizedUpper = Self.stripDiacritics(upper)
-
-        if elapsed > 35.0 {
+        // Janela estendida (240s = 4 min) se a oferta tocou enquanto o motorista já estava terminando outra corrida
+        let maxWindow: TimeInterval = wasInActiveTripWhenOfferArrived ? 240.0 : 35.0
+        if elapsed > maxWindow {
             acceptedHitCount = 0
             idleHitCount = 0
             didSendAcceptedForLastOffer = true
@@ -277,11 +311,12 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             return
         }
 
-        // Snapshot de diagnóstico (a cada 2,0s enquanto o desfecho está pendente)
-        if (now - lastSnapshotTime) >= 2.0 {
+        // Snapshot de diagnóstico (a cada 2,0s nos primeiros 35s)
+        if elapsed <= 35.0 && (now - lastSnapshotTime) >= 2.0 {
             lastSnapshotTime = now
+            let modeTag = wasInActiveTripWhenOfferArrived ? "[ENCAIXADA]" : "[LIVRE]"
             let flat = upper.replacingOccurrences(of: "\n", with: " | ")
-            sendTextStatus(status: "SCREEN_SNAPSHOT", text: String(flat.prefix(380)))
+            sendTextStatus(status: "SCREEN_SNAPSHOT", text: "\(modeTag) " + String(flat.prefix(360)))
         }
 
         // 1. Verifica se o motorista está em outro app do iPhone (WhatsApp, Tela de Início, etc.)
@@ -290,11 +325,13 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         }
 
         // 2. Verifica se voltou para a tela ociosa (radar "Buscando" da 99 ou "Você está online" da Uber)
-        if isIdleRadarScreen(upper: upper, normalizedUpper: normalizedUpper, cleanLines: cleanLines) {
+        if isIdle {
             acceptedHitCount = 0
             idleHitCount += 1
             if idleHitCount >= 2 && elapsed >= 1.8 {
                 idleHitCount = 0
+                isDriverCurrentlyOnTrip = false
+                preOfferScreenSnapshot = ""
                 didSendAcceptedForLastOffer = true
                 didSendClearCard = true
                 sendPingStatus(status: "RIDE_DECLINED")
@@ -308,101 +345,158 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             return
         }
 
-        // 4. SINAIS DE ACEITE (avaliados quando o card da oferta e o preço R$ já saíram da tela):
+        // 4. Se a oferta tocou durante uma corrida já em andamento, verifica se o motorista está encerrando a corrida anterior
+        if wasInActiveTripWhenOfferArrived {
+            let isFinishingPreviousTripScreen =
+                normalizedUpper.contains("FINALIZAR CORRIDA") ||
+                normalizedUpper.contains("FINALIZAR VIAGEM") ||
+                normalizedUpper.contains("CONCLUIR VIAGEM") ||
+                normalizedUpper.contains("CONCLUIR CORRIDA") ||
+                normalizedUpper.contains("ENCERRAR CORRIDA") ||
+                normalizedUpper.contains("RECEBER DINHEIRO") ||
+                normalizedUpper.contains("VALOR A COBRAR") ||
+                normalizedUpper.contains("CONFIRMAR PAGAMENTO") ||
+                normalizedUpper.contains("AVALIE O PASSAGEIRO") ||
+                normalizedUpper.contains("AVALIAR PASSAGEIRO") ||
+                normalizedUpper.contains("COMO FOI A VIAGEM") ||
+                normalizedUpper.contains("COMO FOI A CORRIDA")
+
+            if isFinishingPreviousTripScreen {
+                didFinishPreviousTripAfterOffer = true
+                acceptedHitCount = 0
+                return
+            }
+        }
+
+        // Se estava em uma corrida anterior e ela AINDA NÃO foi finalizada, bloqueia sinais genéricos da corrida 1!
+        let isStillOnPreviousTrip = wasInActiveTripWhenOfferArrived && !didFinishPreviousTripAfterOffer
+
         var matchedReason: String? = nil
         var confidenceWeight: Int = 0
 
-        // SINAL A (Alta Confiança — Frases exclusivas de corrida em andamento / embarque)
-        let highConfidencePhrases: [(pattern: String, label: String)] = [
-            ("INICIAR VIAGEM", "Iniciar viagem"),
-            ("INICIAR CORRIDA", "Iniciar corrida"),
-            ("INICIAR UBER", "Iniciar Uber"),
-            ("IR PARA O EMBARQUE", "Ir para o embarque"),
-            ("ATE O EMBARQUE", "Até o embarque"),
-            ("LOCAL DE EMBARQUE", "Local de embarque"),
-            ("PONTO DE EMBARQUE", "Ponto de embarque"),
-            ("EMBARQUE DE ", "Embarque de passageiro"),
-            ("EMBARQUE EM ", "Embarque em"),
-            ("A CAMINHO D", "A caminho do passageiro"),
-            ("CHEGUEI", "Botão Cheguei"),
-            ("VOCE CHEGOU", "Você chegou"),
-            ("DESLIZE PARA", "Deslize para iniciar/chegar"),
-            ("AGUARDANDO PASSAGEIRO", "Aguardando passageiro"),
-            ("BUSCAR PASSAGEIRO", "Buscar passageiro"),
-            ("BUSCANDO PASSAGEIRO", "Buscando passageiro"),
-            ("PEGAR PASSAGEIRO", "Pegar passageiro"),
-            ("INDO BUSCAR", "Indo buscar"),
-            ("INDO ATE", "Indo até passageiro"),
-            ("ENCONTRAR COM", "Encontrar com passageiro"),
-            ("ENCONTRO COM", "Encontro com passageiro"),
-            ("FALAR COM PASSAGEIRO", "Falar com passageiro"),
-            ("NOTIFICAR PASSAGEIRO", "Notificar passageiro"),
-            ("LIGAR PARA PASSAGEIRO", "Ligar para passageiro"),
-            ("CORRIDA ACEITA", "Corrida aceita"),
-            ("VIAGEM ACEITA", "Viagem aceita"),
-            ("CONECTANDO AO PASSAGEIRO", "Conectando ao passageiro"),
-            ("CANCELAR VIAGEM", "Cancelar viagem"),
-            ("CANCELAR CORRIDA", "Cancelar corrida")
-        ]
-
-        for item in highConfidencePhrases {
-            if normalizedUpper.contains(item.pattern) {
-                matchedReason = item.label
-                confidenceWeight = 2 // Confirma imediatamente se já passou ≥0.7s, ou em 2 frames rápidos
-                break
-            }
-        }
-
-        // SINAL B (Média-Alta Confiança — Elementos de navegação ativa até o passageiro na 99/Uber/Waze/Maps)
-        if matchedReason == nil {
-            let navPhrases: [(pattern: String, label: String)] = [
-                ("EMBARQUE", "Tela de embarque"),
-                ("A CAMINHO", "A caminho"),
-                ("NAVEGAR", "Botão Navegar ativo"),
-                ("CHEGADA ", "Barra de chegada (ETA)"),
-                ("CHEGADA:", "Barra de chegada (ETA)"),
-                ("CHEGADA AS", "Chegada às"),
-                ("CHEGADA EM", "Chegada em"),
-                ("VIRE A DIREITA", "Navegação: Vire à direita"),
-                ("VIRE A ESQUERDA", "Navegação: Vire à esquerda"),
-                ("SIGA EM FRENTE", "Navegação: Siga em frente"),
-                ("SIGA PELA", "Navegação: Siga pela via"),
-                ("SIGA NA ", "Navegação: Siga na via"),
-                ("MANTENHA-SE A", "Navegação: Mantenha-se"),
-                ("PEGUE A SAIDA", "Navegação: Pegue a saída"),
-                ("NA ROTATORIA", "Navegação: Rotatória"),
-                ("RECENTRALIZAR", "Mapa em navegação"),
-                ("KM/H", "Velocímetro de navegação")
+        if isStillOnPreviousTrip {
+            // MODO CORRIDA ENCAIXADA (Corrida 1 ainda em andamento):
+            // NUNCA aceita por "Navegar", "km/h", "Vire à", "Chegada" ou "1 passo min/km", pois pertencem à Corrida 1!
+            // Só confirma imediatamente se aparecer confirmação explícita de fila/aceite OU o novo endereço de embarque da Corrida 2!
+            let stackedConfirmPhrases: [(pattern: String, label: String)] = [
+                ("CORRIDA ACEITA", "Corrida encaixada aceita"),
+                ("VIAGEM ACEITA", "Viagem encaixada aceita"),
+                ("PROXIMA CORRIDA", "Próxima corrida na fila"),
+                ("PROXIMA VIAGEM", "Próxima viagem na fila"),
+                ("ADICIONADA A FILA", "Corrida adicionada à fila"),
+                ("CORRIDA NA FILA", "Corrida na fila")
             ]
-            for item in navPhrases {
+            for item in stackedConfirmPhrases {
                 if normalizedUpper.contains(item.pattern) {
                     matchedReason = item.label
-                    confidenceWeight = 1
+                    confidenceWeight = 2
                     break
                 }
             }
-        }
 
-        // SINAL C (Persistência do endereço de embarque da oferta na tela de navegação, sem preço R$)
-        if matchedReason == nil && elapsed >= 0.8 && activeOfferPickupStreet.count >= 5 {
-            if normalizedUpper.contains(activeOfferPickupStreet) {
-                matchedReason = "Rota p/ endereço de embarque (\(activeOfferPickupStreet))"
-                confidenceWeight = 1
+            // Ou se o endereço de embarque exclusivo da Corrida 2 (que não estava na tela da Corrida 1) permanecer na tela sem o preço R$
+            if matchedReason == nil && elapsed >= 1.2 && activeOfferPickupStreet.count >= 6 {
+                let wasAlreadyOnScreenInRide1 = preOfferScreenSnapshot.contains(activeOfferPickupStreet)
+                if !wasAlreadyOnScreenInRide1 && normalizedUpper.contains(activeOfferPickupStreet) {
+                    matchedReason = "Novo embarque encaixado (\(activeOfferPickupStreet))"
+                    confidenceWeight = 1
+                }
             }
-        }
+        } else {
+            // MODO LIVRE (ou após a Corrida 1 já ter sido finalizada!):
+            // Todas as 4 camadas de detecção de embarque e navegação estão ativas.
 
-        // SINAL D (Barra única de tempo/distância até o passageiro na tela de navegação, sem preço R$)
-        if matchedReason == nil && elapsed >= 0.8 {
-            let (_, _, totalKm, _, _, totalMin, stepCount) = extractStructuredSteps(from: allScreenText)
-            if stepCount == 1 && totalKm > 0 && totalMin > 0 && totalMin <= max(pendingOffer.pickupMinutes + 6, 15) {
-                matchedReason = "Barra de deslocamento até embarque (\(totalMin) min)"
-                confidenceWeight = 1
+            // SINAL A (Alta Confiança — Frases exclusivas de corrida em andamento / embarque)
+            let highConfidencePhrases: [(pattern: String, label: String)] = [
+                ("INICIAR VIAGEM", "Iniciar viagem"),
+                ("INICIAR CORRIDA", "Iniciar corrida"),
+                ("INICIAR UBER", "Iniciar Uber"),
+                ("IR PARA O EMBARQUE", "Ir para o embarque"),
+                ("ATE O EMBARQUE", "Até o embarque"),
+                ("LOCAL DE EMBARQUE", "Local de embarque"),
+                ("PONTO DE EMBARQUE", "Ponto de embarque"),
+                ("EMBARQUE DE ", "Embarque de passageiro"),
+                ("EMBARQUE EM ", "Embarque em"),
+                ("A CAMINHO D", "A caminho do passageiro"),
+                ("CHEGUEI", "Botão Cheguei"),
+                ("VOCE CHEGOU", "Você chegou"),
+                ("DESLIZE PARA", "Deslize para iniciar/chegar"),
+                ("AGUARDANDO PASSAGEIRO", "Aguardando passageiro"),
+                ("BUSCAR PASSAGEIRO", "Buscar passageiro"),
+                ("BUSCANDO PASSAGEIRO", "Buscando passageiro"),
+                ("PEGAR PASSAGEIRO", "Pegar passageiro"),
+                ("INDO BUSCAR", "Indo buscar"),
+                ("INDO ATE", "Indo até passageiro"),
+                ("ENCONTRAR COM", "Encontrar com passageiro"),
+                ("ENCONTRO COM", "Encontro com passageiro"),
+                ("FALAR COM PASSAGEIRO", "Falar com passageiro"),
+                ("NOTIFICAR PASSAGEIRO", "Notificar passageiro"),
+                ("LIGAR PARA PASSAGEIRO", "Ligar para passageiro"),
+                ("CORRIDA ACEITA", "Corrida aceita"),
+                ("VIAGEM ACEITA", "Viagem aceita"),
+                ("CONECTANDO AO PASSAGEIRO", "Conectando ao passageiro"),
+                ("CANCELAR VIAGEM", "Cancelar viagem"),
+                ("CANCELAR CORRIDA", "Cancelar corrida")
+            ]
+
+            for item in highConfidencePhrases {
+                if normalizedUpper.contains(item.pattern) {
+                    matchedReason = item.label
+                    confidenceWeight = 2
+                    break
+                }
+            }
+
+            // SINAL B (Média-Alta Confiança — Elementos de navegação ativa até o passageiro na 99/Uber/Waze/Maps)
+            if matchedReason == nil {
+                let navPhrases: [(pattern: String, label: String)] = [
+                    ("EMBARQUE", "Tela de embarque"),
+                    ("A CAMINHO", "A caminho"),
+                    ("NAVEGAR", "Botão Navegar ativo"),
+                    ("CHEGADA ", "Barra de chegada (ETA)"),
+                    ("CHEGADA:", "Barra de chegada (ETA)"),
+                    ("CHEGADA AS", "Chegada às"),
+                    ("CHEGADA EM", "Chegada em"),
+                    ("VIRE A DIREITA", "Navegação: Vire à direita"),
+                    ("VIRE A ESQUERDA", "Navegação: Vire à esquerda"),
+                    ("SIGA EM FRENTE", "Navegação: Siga em frente"),
+                    ("SIGA PELA", "Navegação: Siga pela via"),
+                    ("SIGA NA ", "Navegação: Siga na via"),
+                    ("MANTENHA-SE A", "Navegação: Mantenha-se"),
+                    ("PEGUE A SAIDA", "Navegação: Pegue a saída"),
+                    ("NA ROTATORIA", "Navegação: Rotatória"),
+                    ("RECENTRALIZAR", "Mapa em navegação"),
+                    ("KM/H", "Velocímetro de navegação")
+                ]
+                for item in navPhrases {
+                    if normalizedUpper.contains(item.pattern) {
+                        matchedReason = item.label
+                        confidenceWeight = 1
+                        break
+                    }
+                }
+            }
+
+            // SINAL C (Persistência do endereço de embarque da oferta na tela de navegação, sem preço R$)
+            if matchedReason == nil && elapsed >= 0.8 && activeOfferPickupStreet.count >= 5 {
+                if normalizedUpper.contains(activeOfferPickupStreet) {
+                    matchedReason = "Rota p/ endereço de embarque (\(activeOfferPickupStreet))"
+                    confidenceWeight = 1
+                }
+            }
+
+            // SINAL D (Barra única de tempo/distância até o passageiro na tela de navegação, sem preço R$)
+            if matchedReason == nil && elapsed >= 0.8 {
+                let (_, _, totalKm, _, _, totalMin, stepCount) = extractStructuredSteps(from: allScreenText)
+                if stepCount == 1 && totalKm > 0 && totalMin > 0 && totalMin <= max(pendingOffer.pickupMinutes + 6, 15) {
+                    matchedReason = "Barra de deslocamento até embarque (\(totalMin) min)"
+                    confidenceWeight = 1
+                }
             }
         }
 
         if let reason = matchedReason {
             idleHitCount = 0
-            // Mesmo sinais de peso 2 exigem elapsed >= 0.7s ou 2 leituras para máxima segurança
             if confidenceWeight >= 2 && elapsed >= 0.75 {
                 acceptedHitCount += 2
             } else {
@@ -411,11 +505,31 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
 
             if acceptedHitCount >= 2 {
                 acceptedHitCount = 0
+                isDriverCurrentlyOnTrip = true
+                preOfferScreenSnapshot = normalizedUpper
                 didSendAcceptedForLastOffer = true
                 didSendClearCard = true
                 sendAcceptedOfferViaUDP(pendingOffer, reason: reason)
             }
         }
+    }
+
+    private func hasActiveTripOrNavigationIndicators(_ normalizedUpper: String) -> Bool {
+        return normalizedUpper.contains("NAVEGAR") ||
+               normalizedUpper.contains("KM/H") ||
+               normalizedUpper.contains("VIRE A DIREITA") ||
+               normalizedUpper.contains("VIRE A ESQUERDA") ||
+               normalizedUpper.contains("SIGA EM FRENTE") ||
+               normalizedUpper.contains("SIGA PELA") ||
+               normalizedUpper.contains("CHEGADA ") ||
+               normalizedUpper.contains("CHEGADA AS") ||
+               normalizedUpper.contains("CHEGUEI") ||
+               normalizedUpper.contains("INICIAR CORRIDA") ||
+               normalizedUpper.contains("INICIAR VIAGEM") ||
+               normalizedUpper.contains("EMBARQUE") ||
+               normalizedUpper.contains("A CAMINHO") ||
+               normalizedUpper.contains("FINALIZAR CORRIDA") ||
+               normalizedUpper.contains("FINALIZAR VIAGEM")
     }
 
     private func isIdleRadarScreen(upper: String, normalizedUpper: String, cleanLines: [String]) -> Bool {
