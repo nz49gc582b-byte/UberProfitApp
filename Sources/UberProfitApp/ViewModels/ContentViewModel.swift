@@ -175,7 +175,7 @@ public final class ContentViewModel: ObservableObject {
             }
         }
 
-        udpListener.onRideAcceptedWithOffer = { [weak self] offer, reason in
+        udpListener.onRideAcceptedWithOffer = { [weak self] offer, reason, replaceTimestamp in
             Task { @MainActor in
                 guard let self = self else { return }
                 guard self.config.autoDetectAcceptedRides else {
@@ -184,6 +184,11 @@ public final class ContentViewModel: ObservableObject {
                 }
                 let analysis = ProfitCalculator.evaluate(offer: offer, settings: self.currentSettings)
                 self.lastSeenAnalysis = analysis
+
+                if let prevTs = replaceTimestamp {
+                    self.acceptedRides.removeAll { abs($0.offer.timestamp - prevTs) < 0.05 }
+                }
+
                 if !self.history.contains(where: { $0.isSameOffer(as: analysis) }) {
                     self.history.insert(analysis, at: 0)
                     if self.history.count > self.maxHistoryItems {

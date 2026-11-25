@@ -13,7 +13,7 @@ public final class UDPListenerManager: ObservableObject {
     public var onOfferReceived: (@Sendable (RideOfferPayload) -> Void)?
     public var onClearCardRequested: (@Sendable () -> Void)?
     public var onRideAcceptedDetected: (@Sendable () -> Void)?
-    public var onRideAcceptedWithOffer: (@Sendable (RideOfferPayload, String) -> Void)?
+    public var onRideAcceptedWithOffer: (@Sendable (RideOfferPayload, String, TimeInterval?) -> Void)?
     /// kind: "DECLINED" | "UNKNOWN" | "SNAPSHOT"
     public var onRideOutcome: (@Sendable (String, String) -> Void)?
     public var onHeartbeatReceived: (@Sendable () -> Void)?
@@ -152,13 +152,14 @@ public final class UDPListenerManager: ObservableObject {
 
     nonisolated private func handleIncomingData(_ data: Data) {
         if let acceptedEvent = try? JSONDecoder().decode(AcceptedRideEventPayload.self, from: data),
-           acceptedEvent.status == "RIDE_ACCEPTED" {
+           (acceptedEvent.status == "RIDE_ACCEPTED" || acceptedEvent.status == "RIDE_ACCEPTED_CORRECTION") {
+            let replaceTs = (acceptedEvent.status == "RIDE_ACCEPTED_CORRECTION") ? acceptedEvent.previousOfferTimestamp : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.lastPacketTime = Date()
                 self.broadcastActive = true
                 self.onHeartbeatReceived?()
-                self.onRideAcceptedWithOffer?(acceptedEvent.offer, acceptedEvent.triggerReason)
+                self.onRideAcceptedWithOffer?(acceptedEvent.offer, acceptedEvent.triggerReason, replaceTs)
             }
             return
         }

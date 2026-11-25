@@ -62,6 +62,7 @@ public struct AcceptedRideEventPayload: Codable, Sendable, Equatable {
     public let status: String
     public let triggerReason: String
     public let offer: RideOfferPayload
+    public let previousOfferTimestamp: TimeInterval?
 }
 
 /// Modo de exibição visual escolhido pelo motorista
