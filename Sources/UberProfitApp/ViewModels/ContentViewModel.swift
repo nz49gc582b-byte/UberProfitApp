@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import AVKit
 import Combine
 
@@ -77,6 +78,12 @@ public final class ContentViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.checkAndResetDailyTurn() }
+            }
+            .store(in: &cancellables)
+
         checkAndResetDailyTurn()
     }
 
@@ -91,8 +98,13 @@ public final class ContentViewModel: ObservableObject {
         }
 
         if config.currentTurnDate != today {
-            // Novo dia: arquiva o que sobrou do turno anterior
-            if !acceptedRides.isEmpty {
+            // Se o motorista está no meio de um turno da madrugada (última corrida aceita há menos de 4h),
+            // NÃO corta o turno dele ao meio à meia-noite; só arquiva após pausa real (>= 4h) ou se estiver vazio.
+            if let lastTimestamp = acceptedRides.map({ $0.offer.timestamp }).max() {
+                let inactiveSeconds = Date().timeIntervalSince1970 - lastTimestamp
+                if inactiveSeconds < 4.0 * 3600.0 {
+                    return
+                }
                 finishTurn(reason: "Novo dia")
             } else {
                 config.extraDailyExpenseBRL = 0.0
@@ -150,7 +162,7 @@ public final class ContentViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 if let candidate = self.latestAnalysis ?? self.lastSeenAnalysis {
-                    self.acceptRide(candidate, source: "notificação")
+                    self.acceptRide(candidate, source: "notificação", showFeedback: true)
                 }
             }
         }
@@ -185,8 +197,17 @@ public final class ContentViewModel: ObservableObject {
                 let analysis = ProfitCalculator.evaluate(offer: offer, settings: self.currentSettings)
                 self.lastSeenAnalysis = analysis
 
+                // Ignora o 2º e o 3º pacote da rajada UDP se esta corrida já estiver registrada nos Ganhos
+                if self.isRideAlreadyAccepted(analysis) {
+                    return
+                }
+
                 if let prevTs = replaceTimestamp {
-                    self.acceptedRides.removeAll { abs($0.offer.timestamp - prevTs) < 0.05 }
+                    let beforeCount = self.acceptedRides.count
+                    self.acceptedRides.removeAll { abs($0.offer.timestamp - prevTs) < 0.05 && !$0.isSameOffer(as: analysis) }
+                    if self.acceptedRides.count != beforeCount {
+                        self.persistence.saveAcceptedRides(self.acceptedRides)
+                    }
                 }
 
                 if !self.history.contains(where: { $0.isSameOffer(as: analysis) }) {
@@ -241,16 +262,28 @@ public final class ContentViewModel: ObservableObject {
     // MARK: - Ofertas
 
     public func processIncomingOffer(_ offer: RideOfferPayload, recordInHistory: Bool = true) {
+        if recordInHistory {
+            checkAndResetDailyTurn()
+        }
         let settings = currentSettings
         let analysis = ProfitCalculator.evaluate(offer: offer, settings: settings)
+
+        let sig = "\(offer.appSource)-\(Int((offer.fareBRL * 100).rounded()))-\(Int((offer.totalDistanceKm * 10).rounded()))-\(offer.totalMinutes)"
+        let isRepeatedSameCard = recordInHistory && (sig == lastAnnouncedSignature) && (abs(offer.timestamp - lastAnnouncedTime) < 18.0)
+
+        // Reenvio tardio de uma oferta que JÁ foi registrada nos Ganhos: ignora (não pode sobrescrever a confirmação verde do PiP)
+        if isRepeatedSameCard && isRideAlreadyAccepted(analysis) {
+            return
+        }
+
+        let wasShowingNothing = (self.latestAnalysis == nil)
         self.latestAnalysis = analysis
         self.lastSeenAnalysis = analysis
 
-        // Atualiza sempre o PiP em tempo real (com flush + invalidatePlaybackState)
-        self.pipManager.updateCard(with: analysis, displayMode: self.config.primaryMetricDisplay)
-
-        let sig = "\(offer.appSource)-\(Int((offer.fareBRL * 100).rounded()))-\(Int((offer.totalDistanceKm * 10).rounded()))-\(offer.totalMinutes)"
-        let isRepeatedSameCard = recordInHistory && (sig == lastAnnouncedSignature) && ((offer.timestamp - lastAnnouncedTime) < 18.0)
+        // Redesenha o PiP só quando muda a oferta (ou quando ele estava vazio): evita piscar/gastar CPU nos reenvios a cada ~2s
+        if !isRepeatedSameCard || wasShowingNothing {
+            self.pipManager.updateCard(with: analysis, displayMode: self.config.primaryMetricDisplay)
+        }
 
         guard !isRepeatedSameCard else { return }
 
@@ -301,12 +334,15 @@ public final class ContentViewModel: ObservableObject {
 
     @discardableResult
     public func acceptRide(_ ride: RideAnalysis, source: String = "manual", showFeedback: Bool = false) -> Bool {
+        checkAndResetDailyTurn()
         guard !acceptedRides.contains(where: { $0.isSameOffer(as: ride) }) else { return false }
         acceptedRides.append(ride)
         persistence.saveAcceptedRides(acceptedRides)
-        latestAnalysis = nil
-        pipManager.showAcceptedConfirmation(for: ride)
+        // Confirmação visual/banner só no registro AUTOMÁTICO. Registro manual (ex.: pelo Histórico) não pode
+        // limpar a oferta ao vivo nem piscar o PiP com uma corrida antiga.
         if showFeedback {
+            latestAnalysis = nil
+            pipManager.showAcceptedConfirmation(for: ride)
             notificationManager.sendRideAcceptedBanner(analysis: ride)
         }
         addLog(
@@ -317,13 +353,19 @@ public final class ContentViewModel: ObservableObject {
     }
 
     public func removeAcceptedRide(_ ride: RideAnalysis) {
-        acceptedRides.removeAll(where: { $0.id == ride.id })
+        acceptedRides.removeAll(where: { $0.id == ride.id || $0.isSameOffer(as: ride) })
         persistence.saveAcceptedRides(acceptedRides)
         addLog("Corrida removida dos ganhos: [\(ride.offer.appSource)] \(Fmt.brl(ride.offer.fareBRL))", kind: .system)
     }
 
     public func isRideAlreadyAccepted(_ ride: RideAnalysis) -> Bool {
         acceptedRides.contains(where: { $0.isSameOffer(as: ride) })
+    }
+
+    public func isRideInArchivedTurns(_ ride: RideAnalysis) -> Bool {
+        archivedTurns.contains { turn in
+            turn.rides.contains { $0.isSameOffer(as: ride) }
+        }
     }
 
     public func finishTurn(reason: String = "Manual") {

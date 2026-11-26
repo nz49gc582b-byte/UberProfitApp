@@ -16,8 +16,8 @@ public struct RideDetailSheet: View {
     }
 
     public var body: some View {
-        let inShift = viewModel.acceptedRides.contains { $0.id == ride.id }
-        let registered = viewModel.isRideAlreadyAccepted(ride)
+        let inShift = viewModel.isRideAlreadyAccepted(ride)
+        let inArchive = viewModel.isRideInArchivedTurns(ride)
         let date = Date(timeIntervalSince1970: ride.offer.timestamp)
 
         return NavigationStack {
@@ -63,7 +63,7 @@ public struct RideDetailSheet: View {
                         } label: {
                             Label("Remover dos ganhos", systemImage: "minus.circle")
                         }
-                    } else if registered {
+                    } else if inArchive {
                         Label("Registrada em um extrato anterior", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.secondary)
                     } else {

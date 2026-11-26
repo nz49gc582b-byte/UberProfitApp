@@ -136,7 +136,9 @@ public enum RideVerdict: String, Codable, Sendable {
 
 /// Resultado completo do cálculo de lucratividade (persistível em JSON / UserDefaults)
 public struct RideAnalysis: Identifiable, Codable, Sendable, Equatable {
-    public var id: String { "\(offer.appSource)-\(offer.timestamp)" }
+    public var id: String {
+        "\(offer.appSource)-\(offer.timestamp)-\(Int((offer.fareBRL * 100).rounded()))-\(Int((offer.totalDistanceKm * 10).rounded()))"
+    }
     public let offer: RideOfferPayload
     public let grossPerKm: Double
     public let grossPerHour: Double

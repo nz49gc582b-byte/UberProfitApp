@@ -52,8 +52,9 @@ public final class VoiceAlertManager: NSObject, ObservableObject, @preconcurrenc
         let kmValue = (settings.primaryMetricDisplay == .net) ? analysis.netPerKm : analysis.grossPerKm
         let hourValue = (settings.primaryMetricDisplay == .net) ? analysis.netPerHour : analysis.grossPerHour
 
-        let reais = Int(max(kmValue, 0))
-        let centavos = Int(((max(kmValue, 0) - Double(reais)) * 100).rounded())
+        let totalCents = Int((max(kmValue, 0) * 100).rounded())
+        let reais = totalCents / 100
+        let centavos = totalCents % 100
         let horaInt = Int(max(hourValue, 0).rounded())
         let lucroInt = Int(analysis.netProfitBRL.rounded())
 

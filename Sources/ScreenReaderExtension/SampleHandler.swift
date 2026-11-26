@@ -82,6 +82,15 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     private var wasInActiveTripWhenOfferArrived: Bool = false
     private var didFinishPreviousTripAfterOffer: Bool = false
     private var preOfferScreenSnapshot: String = ""
+    private var lastAcceptedHitTime: TimeInterval = 0
+
+    /// Nível de "restos de card de oferta" ainda visíveis na tela:
+    /// `.hard` = certeza de que ainda é card/lista/aviso (bloqueia qualquer registro);
+    /// `.soft` = textos que também podem existir na tela da corrida aceita (só frases fortes de embarque registram);
+    /// `.none` = tela limpa de card.
+    private enum CardRemnantLevel {
+        case none, soft, hard
+    }
 
     private var udpConnection: NWConnection?
     private let processingQueue = DispatchQueue(label: "com.uberprofit.screenreader.vision", qos: .userInteractive)
@@ -109,6 +118,11 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     private static let uberSummaryRegex = try! NSRegularExpression(
         pattern: #"(?:(\d{1,2})\s*h(?:oras?)?\s*)?(\d{1,3})\s*min(?:utos?)?\s*[•·\-]\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(km|m)\b"#,
         options: [.caseInsensitive]
+    )
+    // Número "99" isolado (marca do app), sem colar em outros dígitos/vírgulas: evita confundir "R$ 19,99" ou "Av. 2399" com a 99
+    private static let standalone99Regex = try! NSRegularExpression(
+        pattern: #"(?<![\d.,])99(?![\d.,])"#,
+        options: []
     )
     // Multiplicadores de mapa ocioso da 99: "1,1 ~ 1,6x" ou "1,1X-1,6X"
     private static let idleSurgeBadgeRegex = try! NSRegularExpression(
@@ -224,7 +238,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             if let activeHash = activeOfferPayload.map({ computeOfferHash(fare: $0.fareBRL, totalKm: $0.totalDistanceKm, totalMin: $0.totalMinutes) }) {
                 candidatePool.removeAll { $0.hash == activeHash }
             }
-            if candidatePool.isEmpty {
+            // Só avisa UMA vez (antes repetia a cada quadro enquanto o aviso estava na tela)
+            if candidatePool.isEmpty && !didSendAcceptedForLastOffer {
                 didSendAcceptedForLastOffer = true
                 didSendClearCard = true
                 sendPingStatus(status: "RIDE_DECLINED")
@@ -363,7 +378,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         timestamp: TimeInterval
     ) -> [ParsedCardBlock] {
         let lowerAll = allScreenText.lowercased()
-        let is99Screen = lowerAll.contains("99") ||
+        let is99Screen = containsStandalone99(lowerAll) ||
                          lowerAll.contains("solicitações") ||
                          lowerAll.contains("solicitacoes") ||
                          lowerAll.contains("buscando") ||
@@ -401,7 +416,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                 let endIdx = (k + 1 < fareLineIndices.count) ? (fareLineIndices[k + 1].index - 1) : (lines.count - 1)
                 guard startIdx <= endIdx else { continue }
                 let slice = Array(lines[startIdx...endIdx])
-                if let block = buildCardBlock(from: slice, explicitFare: fareLineIndices[k].fare, force99: is99Screen, timestamp: timestamp) {
+                let cardTimestamp = timestamp + Double(k) * 0.12
+                if let block = buildCardBlock(from: slice, explicitFare: fareLineIndices[k].fare, force99: is99Screen, timestamp: cardTimestamp) {
                     results.append(block)
                 }
             }
@@ -417,6 +433,11 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         }
 
         return []
+    }
+
+    private func containsStandalone99(_ text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return Self.standalone99Regex.firstMatch(in: text, options: [], range: range) != nil
     }
 
     private func extractFareFromSingleLine(_ line: RecognizedLine) -> Double? {
@@ -459,7 +480,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     ) -> ParsedCardBlock? {
         let sliceText = sliceLines.map(\.text).joined(separator: "\n")
         let lowerSlice = sliceText.lowercased()
-        let is99 = force99 || lowerSlice.contains("99") || lowerSlice.contains("negocia") || lowerSlice.contains("pop") || lowerSlice.contains("corridas")
+        let is99 = force99 || containsStandalone99(lowerSlice) || lowerSlice.contains("negocia") || lowerSlice.contains("pop nova") || lowerSlice.contains("corridas")
         let appSource = is99 ? "99" : "UBER"
 
         let (pickupKm, tripKm, totalKm, pickupMin, tripMin, totalMin, stepCount) = extractStructuredSteps(from: sliceText)
@@ -531,10 +552,15 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             return
         }
 
+        // Corridas vistas na MESMA "sessão de visualização" (até 6s antes do último quadro com card na tela).
+        // Ofertas antigas já recusadas/ignoradas que ainda estão no pool NÃO podem ser confundidas com a aceita.
+        let freshestSeen = candidatePool.map { $0.lastSeenTime }.max() ?? now
+        let sessionPoolForDecision = candidatePool.filter { freshestSeen - $0.lastSeenTime <= 6.0 }
+
         // Snapshot de diagnóstico (a cada 2,0s nos primeiros 35s)
         if elapsed <= 35.0 && (now - lastSnapshotTime) >= 2.0 {
             lastSnapshotTime = now
-            let modeTag = wasInActiveTripWhenOfferArrived ? "[ENCAIXADA]" : (candidatePool.count > 1 ? "[LISTA:\(candidatePool.count)]" : "[LIVRE]")
+            let modeTag = wasInActiveTripWhenOfferArrived ? "[ENCAIXADA]" : (sessionPoolForDecision.count > 1 ? "[LISTA:\(sessionPoolForDecision.count)]" : "[LIVRE]")
             let flat = upper.replacingOccurrences(of: "\n", with: " | ")
             sendTextStatus(status: "SCREEN_SNAPSHOT", text: "\(modeTag) " + String(flat.prefix(360)))
         }
@@ -550,11 +576,12 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             return
         }
 
-        // 3. TRAVA ANTI-CARD E ANTI-LISTA DE SOLICITAÇÕES:
-        // Enquanto ainda houver QUALQUER resquício de card de oferta ou da aba/lista de Solicitações na tela
-        // (ex: "42 corridas", "+999 corridas", "R$ 1,25/km", "Pop Nova", "(7 min 2,8 km)", "Perfil Essencial/Premium", "CPF verif"),
-        // o motorista AINDA está olhando o card/lista (ou um card escurecido) e NÃO entrou na tela de viagem!
-        if hasOfferCardOrListRemnants(upper: upper, normalizedUpper: normalizedUpper, cardLines: cardLines) {
+        // 3. TRAVA ANTI-CARD E ANTI-LISTA DE SOLICITAÇÕES (em níveis):
+        //  .hard → preço R$ do card, "Aceitar por R$", "(X min Y km)" da lista, "Solicitações"/"Mais >": ainda é card/lista → bloqueia tudo.
+        //  .soft → "X corridas", "R$/km", "Pop Nova", "Perfil...", "Pgto..." etc.: podem existir também na tela da corrida aceita,
+        //          então NÃO bloqueiam frases fortes de embarque (Cheguei, A caminho, Iniciar corrida...), só os sinais fracos.
+        let remnants = classifyOfferCardRemnants(upper: upper, normalizedUpper: normalizedUpper, cardLines: cardLines)
+        if remnants == .hard {
             acceptedHitCount = 0
             return
         }
@@ -621,10 +648,11 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                 }
             }
 
-            if matchedReason == nil && elapsed >= 1.2 {
-                for candidate in candidatePool where candidate.pickupStreet.count >= 6 {
-                    let wasAlreadyOnScreenInRide1 = preOfferScreenSnapshot.contains(candidate.pickupStreet)
-                    if !wasAlreadyOnScreenInRide1 && normalizedUpper.contains(candidate.pickupStreet) {
+            if matchedReason == nil && elapsed >= 1.2 && remnants == .none {
+                // Só vale com a tela limpa de card: com card escurecido o endereço da oferta ainda aparece e enganaria o app
+                for candidate in sessionPoolForDecision where candidate.pickupStreet.count >= 6 || candidate.pickupKeywords.count >= 2 {
+                    let wasAlreadyOnScreenInRide1 = preOfferScreenSnapshot.contains(candidate.pickupStreet) && candidate.pickupStreet.count >= 6
+                    if !wasAlreadyOnScreenInRide1 && pickupMatches(candidate, in: normalizedUpper) {
                         matchedReason = "Novo embarque encaixado (\(candidate.pickupStreet))"
                         confidenceWeight = 1
                         break
@@ -676,7 +704,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                 }
             }
 
-            if matchedReason == nil {
+            // Sinais fracos (navegação genérica) só valem com a tela 100% limpa de card
+            if matchedReason == nil && remnants == .none {
                 let navPhrases: [(pattern: String, label: String)] = [
                     ("EMBARQUE", "Tela de embarque"),
                     ("A CAMINHO", "A caminho"),
@@ -704,11 +733,34 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                     }
                 }
             }
+
+            // SINAL C (tela limpa de card): o endereço de embarque da oferta continua na tela de navegação, sem o preço R$
+            if matchedReason == nil && remnants == .none && elapsed >= 0.8 {
+                for candidate in sessionPoolForDecision where pickupMatches(candidate, in: normalizedUpper) {
+                    matchedReason = "Rota p/ endereço de embarque (\(candidate.pickupStreet))"
+                    confidenceWeight = 1
+                    break
+                }
+            }
+
+            // SINAL D (tela limpa de card): barra única de tempo/distância até o passageiro, sem preço R$
+            if matchedReason == nil && remnants == .none && elapsed >= 0.8, let pendingOffer = activeOfferPayload {
+                let (_, _, totalKm, _, _, totalMin, stepCount) = extractStructuredSteps(from: allScreenText)
+                if stepCount == 1 && totalKm > 0 && totalMin > 0 && totalMin <= max(pendingOffer.pickupMinutes + 6, 15) {
+                    matchedReason = "Barra de deslocamento até embarque (\(totalMin) min)"
+                    confidenceWeight = 1
+                }
+            }
         }
 
         guard let reason = matchedReason else { return }
 
         idleHitCount = 0
+        // Confirmações precisam ser próximas no tempo (antes, um sinal solto aos 5s + outro aos 20s somavam e registravam)
+        if (now - lastAcceptedHitTime) > 2.5 {
+            acceptedHitCount = 0
+        }
+        lastAcceptedHitTime = now
         if confidenceWeight >= 2 && elapsed >= 0.75 {
             acceptedHitCount += 2
         } else {
@@ -718,18 +770,18 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         guard acceptedHitCount >= 2 else { return }
 
         // SELEÇÃO INTELIGENTE DO POOL:
-        // Se havia 2+ corridas no pool (o motorista estava na Lista de Solicitações),
-        // identifica QUAL das corridas da lista corresponde à tela de navegação aberta!
+        // Considera só as corridas vistas na MESMA "sessão de visualização" (últimos 6s antes do card sumir).
+        // Se havia 2+ (Lista de Solicitações), descobre QUAL delas corresponde à tela de navegação aberta.
         let (bestCandidate, matchDetail, hasDirectScreenMatch) = selectBestMatchingCandidate(
-            from: candidatePool,
+            from: sessionPoolForDecision,
             normalizedScreen: normalizedUpper,
             rawScreen: allScreenText,
             now: now
         )
 
-        // Se havia múltiplas corridas na lista e a tela de GPS ainda está dando zoom (< 3.2s) sem mostrar a rua ou o tempo da corrida escolhida,
-        // aguarda mais alguns frames até a rua/tempo aparecer no GPS para não pegar uma corrida nova que entrou na lista no último segundo!
-        if candidatePool.count >= 2 && !hasDirectScreenMatch && elapsed < 3.2 {
+        // Lista com 2+ corridas e GPS ainda dando zoom (< 3.2s) sem mostrar rua/tempo da corrida escolhida:
+        // aguarda alguns quadros para não pegar uma corrida nova que entrou na lista no último segundo.
+        if sessionPoolForDecision.count >= 2 && !hasDirectScreenMatch && elapsed < 3.2 {
             return
         }
 
@@ -751,7 +803,8 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         sendAcceptedOfferViaUDP(winner.payload, reason: fullReason)
     }
 
-    /// Escolhe qual corrida do pool (lista de solicitações) foi realmente aceita cruzando rua de embarque, tempo/km de busca e tempo de foco
+    /// Escolhe qual corrida do pool (lista de solicitações) foi realmente aceita cruzando rua de embarque, tempo/km de busca,
+    /// tempo de atenção e recência (a última corrida vista antes do card sumir)
     private func selectBestMatchingCandidate(
         from pool: [TrackedOfferCandidate],
         normalizedScreen: String,
@@ -764,6 +817,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         }
 
         let (_, _, navKm, _, _, navMin, stepCount) = extractStructuredSteps(from: rawScreen)
+        let freshest = pool.map { $0.lastSeenTime }.max() ?? now
 
         var bestScore: Int = Int.min
         var bestCandidate: TrackedOfferCandidate = pool[0]
@@ -774,31 +828,36 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             var score = 0
             var matchedTags: [String] = []
 
-            // 1. Match exato da rua de embarque (+120 pts)
-            if candidate.pickupStreet.count >= 5 && normalizedScreen.contains(candidate.pickupStreet) {
+            // 1. Rua / endereço de embarque presente na tela de navegação
+            if candidate.pickupStreet.count >= 6 && normalizedScreen.contains(candidate.pickupStreet) {
                 score += 120
                 matchedTags.append("rua \(candidate.pickupStreet)")
                 anyDirectMatch = true
             } else {
-                // Match por palavras-chave do endereço de embarque (+45 pts por palavra)
                 var kwHits = 0
                 for kw in candidate.pickupKeywords where normalizedScreen.contains(kw) {
                     kwHits += 1
                 }
-                if kwHits > 0 {
+                if kwHits >= 2 {
                     score += kwHits * 45
                     matchedTags.append("endereço")
                     anyDirectMatch = true
+                } else if kwHits == 1 {
+                    score += 20
                 }
             }
 
-            // 2. Match por palavras-chave do destino (+25 pts)
+            // 2. Palavras-chave do destino
+            var destHits = 0
             for kw in candidate.destKeywords where normalizedScreen.contains(kw) {
-                score += 25
+                destHits += 1
+            }
+            if destHits > 0 {
+                score += destHits * 25
                 anyDirectMatch = true
             }
 
-            // 3. Match pelo tempo e distância de busca na barra de navegação (+70 pts)
+            // 3. Tempo e distância de busca na barra de navegação
             if stepCount >= 1 && navMin > 0 {
                 let minDiff = abs(navMin - candidate.payload.pickupMinutes)
                 let kmDiff = abs(navKm - candidate.payload.pickupDistanceKm)
@@ -812,13 +871,20 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                 }
             }
 
-            // 4. Filtro Anti-"Corrida Nova que Entrou na Lista na Hora do Clique":
-            // Uma corrida que o motorista olhou por vários frames (>= 2 leituras) ganha bônus (+30 pts).
-            // Uma corrida que apareceu por apenas 1 frame nos últimos 1.2s antes da lista fechar sofre penalidade (-50 pts),
-            // pois é quase certamente um card novo que entrou na lista enquanto o clique na corrida anterior já estava processando!
-            if candidate.seenFrameCount >= 2 {
-                score += 30
-            } else if (now - candidate.firstSeenTime) < 1.3 {
+            // 4. Recência: a corrida vista por último antes do card/lista sumir é a que foi tocada
+            let gap = freshest - candidate.lastSeenTime
+            if gap <= 0.6 {
+                score += 60
+            } else if gap <= 2.0 {
+                score += 20
+            }
+
+            // 5. Tempo de atenção: corrida olhada por >= 1,5s ganha bônus; "relâmpago" (< 0,9s) é quase certamente um card
+            //    novo que entrou na lista no instante do clique e sofre penalidade
+            let observedFor = candidate.lastSeenTime - candidate.firstSeenTime
+            if observedFor >= 1.5 {
+                score += 40
+            } else if observedFor < 0.9 {
                 score -= 50
             }
 
@@ -832,22 +898,39 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         return (bestCandidate, bestDetail, anyDirectMatch)
     }
 
-    /// Nos primeiros 12s após aceitar uma corrida de uma Lista (2+ candidatos), continua conferindo a placa da rua no GPS.
-    /// Se a placa da rua do GPS confirmar outra corrida que estava na mesma lista, envia correção automática!
+    /// A tela atual cita o endereço de embarque desta corrida? (rua completa ou pelo menos 2 palavras-chave do endereço)
+    private func pickupMatches(_ candidate: TrackedOfferCandidate, in normalizedScreen: String) -> Bool {
+        if candidate.pickupStreet.count >= 6 && normalizedScreen.contains(candidate.pickupStreet) {
+            return true
+        }
+        let hits = candidate.pickupKeywords.filter { normalizedScreen.contains($0) }.count
+        return hits >= 2
+    }
+
+    /// Nos primeiros 12s após aceitar uma corrida de uma Lista (2+ candidatos), confere a rua no GPS UMA vez.
+    /// Se o GPS confirmar OUTRA corrida da mesma lista, envia a correção automática (só uma vez, sem vai-e-volta).
     private func verifyRecentListAcceptAgainstGPSScreen(normalizedUpper: String, now: TimeInterval) {
         guard didSendAcceptedForLastOffer,
-              candidatePool.count >= 2,
               lastAcceptedTimestamp > 0,
               (now - lastAcceptedTimestamp) <= 12.0 else { return }
 
-        for candidate in candidatePool where candidate.hash != lastAcceptedCandidateHash {
-            let matchesFullStreet = candidate.pickupStreet.count >= 6 && normalizedUpper.contains(candidate.pickupStreet)
-            let keywordHits = candidate.pickupKeywords.filter { normalizedUpper.contains($0) }.count
+        let freshest = candidatePool.map { $0.lastSeenTime }.max() ?? now
+        let session = candidatePool.filter { freshest - $0.lastSeenTime <= 6.0 }
+        guard session.count >= 2 else { return }
 
-            if matchesFullStreet || keywordHits >= 2 {
+        // Se a rua da corrida JÁ registrada aparece no GPS, está confirmada: encerra a verificação
+        if let current = session.first(where: { $0.hash == lastAcceptedCandidateHash }),
+           pickupMatches(current, in: normalizedUpper) {
+            lastAcceptedTimestamp = 0
+            return
+        }
+
+        for candidate in session where candidate.hash != lastAcceptedCandidateHash {
+            if pickupMatches(candidate, in: normalizedUpper) {
                 let previousTs = lastAcceptedOfferTimestamp
                 lastAcceptedCandidateHash = candidate.hash
                 lastAcceptedOfferTimestamp = candidate.payload.timestamp
+                lastAcceptedTimestamp = 0 // correção única
                 sendAcceptedCorrectionViaUDP(
                     candidate.payload,
                     previousTimestamp: previousTs,
@@ -873,18 +956,32 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                normalizedUpper.contains("TEMPO ESGOTADO")
     }
 
-    /// Verifica se ainda existem elementos visuais exclusivos de um Card de Oferta ou da Lista de Solicitações na tela
-    private func hasOfferCardOrListRemnants(
+    /// Classifica o que ainda restou de card de oferta / lista de Solicitações na tela.
+    private func classifyOfferCardRemnants(
         upper: String,
         normalizedUpper: String,
         cardLines: [RecognizedLine]
-    ) -> Bool {
-        // 1. Preço de oferta visível no card
+    ) -> CardRemnantLevel {
+        // ---- HARD: certeza de que ainda é card, lista ou aviso de oferta ----
+        // Preço de oferta visível
         if extractMainFareBRL(from: cardLines) != nil {
-            return true
+            return .hard
         }
 
-        // 2. Textos exclusivos de cards de oferta / lista de solicitações da 99 e Uber
+        if normalizedUpper.contains("ACEITAR POR R$") ||
+           normalizedUpper.contains("SOLICITACOES") ||
+           normalizedUpper.contains("MAIS >") {
+            return .hard
+        }
+
+        let nsRange = NSRange(upper.startIndex..<upper.endIndex, in: upper)
+
+        // Formato entre parênteses da Lista/Radar da 99: "(7 min 2,8 km)"
+        if Self.stepInsideParenRegex.firstMatch(in: upper, options: [], range: nsRange) != nil {
+            return .hard
+        }
+
+        // ---- SOFT: textos de card que TAMBÉM podem aparecer na tela da corrida aceita ----
         if normalizedUpper.contains("POP NOVA") ||
            normalizedUpper.contains("PERFIL ESSENCIAL") ||
            normalizedUpper.contains("PERFIL PREMIUM") ||
@@ -894,49 +991,40 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
            normalizedUpper.contains("TARIFA BASE") ||
            normalizedUpper.contains("TAXA DE PARADA") ||
            normalizedUpper.contains("PGTO. NO APP") ||
-           normalizedUpper.contains("NAO AFETA A TA") ||
-           normalizedUpper.contains("ACEITAR POR R$") ||
-           normalizedUpper.contains("SOLICITACOES") ||
-           normalizedUpper.contains("MAIS >") {
-            return true
+           normalizedUpper.contains("NAO AFETA A TA") {
+            return .soft
         }
 
-        let nsRange = NSRange(upper.startIndex..<upper.endIndex, in: upper)
-
-        // 3. Contador de corridas históricas do passageiro no card: "42 corridas", "+999 corridas"
+        // Contador de corridas do passageiro no card: "42 corridas", "+999 corridas"
         if Self.passengerRidesCountRegex.firstMatch(in: upper, options: [], range: nsRange) != nil {
-            return true
+            return .soft
         }
 
-        // 4. Taxa R$/km impressa no card de oferta: "R$ 1,25/km"
+        // Taxa R$/km impressa no card de oferta: "R$ 1,25/km"
         if Self.cardRatePerKmRegex.firstMatch(in: upper, options: [], range: nsRange) != nil {
-            return true
+            return .soft
         }
 
-        // 5. Formato entre parênteses da Lista/Radar da 99: "(7 min 2,8 km)"
-        if Self.stepInsideParenRegex.firstMatch(in: upper, options: [], range: nsRange) != nil {
-            return true
-        }
-
-        return false
+        return .none
     }
 
+    /// Indícios FORTES de que o motorista está em uma corrida em andamento (usado para detectar "corrida encaixada").
+    /// Sinais genéricos de mapa (km/h, navegar, chegada...) ficaram de fora de propósito: aparecem também com o motorista livre.
     private func hasActiveTripOrNavigationIndicators(_ normalizedUpper: String) -> Bool {
-        return normalizedUpper.contains("NAVEGAR") ||
-               normalizedUpper.contains("KM/H") ||
-               normalizedUpper.contains("VIRE A DIREITA") ||
-               normalizedUpper.contains("VIRE A ESQUERDA") ||
-               normalizedUpper.contains("SIGA EM FRENTE") ||
-               normalizedUpper.contains("SIGA PELA") ||
-               normalizedUpper.contains("CHEGADA ") ||
-               normalizedUpper.contains("CHEGADA AS") ||
-               normalizedUpper.contains("CHEGUEI") ||
+        return normalizedUpper.contains("CHEGUEI") ||
+               normalizedUpper.contains("DESLIZE PARA") ||
                normalizedUpper.contains("INICIAR CORRIDA") ||
                normalizedUpper.contains("INICIAR VIAGEM") ||
-               normalizedUpper.contains("EMBARQUE") ||
-               normalizedUpper.contains("A CAMINHO") ||
+               normalizedUpper.contains("A CAMINHO D") ||
+               normalizedUpper.contains("EMBARQUE DE ") ||
+               normalizedUpper.contains("ENCONTRO COM") ||
+               normalizedUpper.contains("CANCELAR CORRIDA") ||
+               normalizedUpper.contains("CANCELAR VIAGEM") ||
                normalizedUpper.contains("FINALIZAR CORRIDA") ||
-               normalizedUpper.contains("FINALIZAR VIAGEM")
+               normalizedUpper.contains("FINALIZAR VIAGEM") ||
+               normalizedUpper.contains("VIRE A DIREITA") ||
+               normalizedUpper.contains("VIRE A ESQUERDA") ||
+               normalizedUpper.contains("SIGA EM FRENTE")
     }
 
     private func isIdleRadarScreen(upper: String, normalizedUpper: String, cleanLines: [String]) -> Bool {
@@ -1021,13 +1109,29 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             }
         }
 
-        let beforeComma = pickupRaw.components(separatedBy: ",").first ?? pickupRaw
-        let cleanStreet = Self.stripDiacritics(beforeComma.uppercased()).trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalStreet = (cleanStreet.count >= 5 && !cleanStreet.contains("PARADA") && !cleanStreet.contains("ACEITAR"))
-            ? String(cleanStreet.prefix(28))
-            : ""
+        let finalStreet = Self.choosePickupStreet(from: pickupRaw)
 
         return (finalStreet, Self.extractSignificantWords(from: pickupRaw), Self.extractSignificantWords(from: destRaw))
+    }
+
+    /// Escolhe o trecho do endereço que é a RUA (ex.: "Loja 2A, Avenida Álvaro Carvalho Barbosa, 2257" → "AVENIDA ALVARO CARVALHO BARBOSA"),
+    /// em vez de usar cegamente o primeiro pedaço antes da vírgula (que pode ser "Loja 2A", "Casa 3" etc.).
+    private static func choosePickupStreet(from rawAddress: String) -> String {
+        let parts = rawAddress.components(separatedBy: ",")
+        let streetPrefixes = ["AVENIDA", "AV.", "AV ", "RUA", "R. ", "TRAVESSA", "TV.", "PASSAGEM", "RODOVIA", "ROD.", "ESTRADA", "ALAMEDA", "PRACA"]
+
+        for part in parts {
+            let norm = stripDiacritics(part.uppercased()).trimmingCharacters(in: .whitespacesAndNewlines)
+            if norm.count >= 6, streetPrefixes.contains(where: { norm.hasPrefix($0) }) {
+                return String(norm.prefix(28))
+            }
+        }
+
+        let first = stripDiacritics((parts.first ?? rawAddress).uppercased()).trimmingCharacters(in: .whitespacesAndNewlines)
+        if first.count >= 5 && !first.contains("PARADA") && !first.contains("ACEITAR") {
+            return String(first.prefix(28))
+        }
+        return ""
     }
 
     private static func extractSignificantWords(from address: String) -> [String] {
