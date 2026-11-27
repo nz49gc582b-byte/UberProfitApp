@@ -83,6 +83,9 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     private var didFinishPreviousTripAfterOffer: Bool = false
     private var preOfferScreenSnapshot: String = ""
     private var lastAcceptedHitTime: TimeInterval = 0
+    private var foreignFrameCount: Int = 0
+    private var lastAccurateRetryTime: TimeInterval = 0
+    private var lastUnreadSnapshotTime: TimeInterval = 0
 
     /// Nível de "restos de card de oferta" ainda visíveis na tela:
     /// `.hard` = certeza de que ainda é card/lista/aviso (bloqueia qualquer registro);
@@ -106,7 +109,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     )
     // Formato Uber e 99 Pop tradicional: "3 min (0.8 km)" ou "8 min (3,2 km)"
     private static let stepOutsideParenRegex = try! NSRegularExpression(
-        pattern: #"(?:(\d{1,2})\s*h(?:oras?)?\s*)?(\d{1,3})\s*min(?:utos?)?\s*\(\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(km|m)\s*\)"#,
+        pattern: #"(?:(\d{1,2})\s*h(?:oras?)?\s*)?(\d{1,3})\s*min(?:utos?)?\s*[\(\[\{]\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(km|m)\s*[\)\]\}]"#,
         options: [.caseInsensitive]
     )
     // Formato 99 Lista de Solicitações / Radar: "(3 min 1 km)" ou "(7 min 2,8 km)"
@@ -197,9 +200,15 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
     }
 
     // MARK: - OCR de Baixa Latência com Suporte a Lista de Corridas e Anti-"Outro Motorista"
-    private func performFastOCR(on pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation, timestamp: TimeInterval) {
+    private func performFastOCR(
+        on pixelBuffer: CVPixelBuffer,
+        orientation: CGImagePropertyOrientation,
+        timestamp: TimeInterval,
+        level: VNRequestTextRecognitionLevel = .fast,
+        isRetry: Bool = false
+    ) {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
+        request.recognitionLevel = level
         request.usesLanguageCorrection = false
         request.minimumTextHeight = 0.010
         request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 0.95)
@@ -266,6 +275,21 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
 
         // Extrai TODOS os cards válidos visíveis na tela (1 card no modo normal, ou 2-3 cards no modo Lista da 99)
         let parsedCards = parseAllRideCardsOnScreen(from: cardLines, allScreenText: allScreenText, timestamp: timestamp)
+
+        // A tela PARECE uma oferta (preço + km/min + botão Aceitar/Negocia) mas a leitura rápida não montou o card:
+        // refaz UMA vez com o OCR preciso (corrige parênteses/vírgulas lidos errado) e, se ainda falhar, grava a tela no Console.
+        if parsedCards.isEmpty && looksLikeOfferScreen(normalizedAll) {
+            if !isRetry && (timestamp - lastAccurateRetryTime) >= 0.9 {
+                lastAccurateRetryTime = timestamp
+                performFastOCR(on: pixelBuffer, orientation: orientation, timestamp: timestamp, level: .accurate, isRetry: true)
+                return
+            }
+            if isRetry && (timestamp - lastUnreadSnapshotTime) >= 3.0 {
+                lastUnreadSnapshotTime = timestamp
+                let flat = normalizedAll.replacingOccurrences(of: "\n", with: " | ")
+                sendTextStatus(status: "SCREEN_SNAPSHOT", text: "[OFERTA NAO LIDA] " + String(flat.prefix(420)))
+            }
+        }
 
         guard !parsedCards.isEmpty else {
             // Se já aceitou uma corrida nos últimos 12s a partir de uma lista, confere se a placa da rua no GPS confirma outro card da lista
@@ -348,6 +372,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         didSendAcceptedForLastOffer = false
         acceptedHitCount = 0
         idleHitCount = 0
+        foreignFrameCount = 0
 
         pruneExpiredHashes(now: timestamp)
 
@@ -532,7 +557,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             if isIdle {
                 isDriverCurrentlyOnTrip = false
                 preOfferScreenSnapshot = ""
-            } else if hasActiveTripOrNavigationIndicators(normalizedUpper) {
+            } else if !isOtherNonDriverApp(normalizedUpper) && hasDriverContext(normalizedUpper) && hasActiveTripOrNavigationIndicators(normalizedUpper) {
                 isDriverCurrentlyOnTrip = true
                 preOfferScreenSnapshot = normalizedUpper
             }
@@ -565,8 +590,37 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             sendTextStatus(status: "SCREEN_SNAPSHOT", text: "\(modeTag) " + String(flat.prefix(360)))
         }
 
-        // 1. Verifica se o motorista está em outro app do iPhone (WhatsApp, Tela de Início, etc.)
-        if isOtherNonDriverApp(normalizedUpper) {
+        // 1+2+3. Contexto da tela: outro app / sem cara de app de corrida / restos de card
+        let remnants = classifyOfferCardRemnants(upper: upper, normalizedUpper: normalizedUpper, cardLines: cardLines)
+        let nsRangeAll = NSRange(upper.startIndex..<upper.endIndex, in: upper)
+        let hasPriceOnScreen = extractMainFareBRL(from: cardLines) != nil
+        let hasListStepsOnScreen = Self.stepInsideParenRegex.firstMatch(in: upper, options: [], range: nsRangeAll) != nil
+
+        // 1. Motorista saiu do app de corrida (WhatsApp, Instagram, Maps, Tela de Início...).
+        //    Quem aceita uma corrida continua DENTRO do app da Uber/99 nos quadros seguintes; quem foi para outro app
+        //    não aceitou: encerra a oferta pendente em vez de deixar qualquer texto solto virar "aceite".
+        let otherApp = isOtherNonDriverApp(normalizedUpper)
+        let hasDriverEvidence = !otherApp && (
+            remnants != .none ||
+            isIdle ||
+            hasDriverContext(normalizedUpper) ||
+            sessionPoolForDecision.contains(where: { pickupMatches($0, in: normalizedUpper) })
+        )
+        if hasDriverEvidence {
+            foreignFrameCount = 0
+        } else {
+            foreignFrameCount += 1
+            acceptedHitCount = 0
+            // Em corrida encaixada (janela de 240s) só um app claramente alheio cancela; sem texto de corrida não conclui nada.
+            let limit = otherApp ? 2 : (wasInActiveTripWhenOfferArrived ? Int.max : 8)
+            if foreignFrameCount >= limit {
+                foreignFrameCount = 0
+                idleHitCount = 0
+                candidatePool.removeAll()
+                didSendAcceptedForLastOffer = true
+                didSendClearCard = true
+                sendPingStatus(status: "RIDE_DECLINED")
+            }
             return
         }
 
@@ -580,8 +634,9 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
         //  .hard → preço R$ do card, "Aceitar por R$", "(X min Y km)" da lista, "Solicitações"/"Mais >": ainda é card/lista → bloqueia tudo.
         //  .soft → "X corridas", "R$/km", "Pop Nova", "Perfil...", "Pgto..." etc.: podem existir também na tela da corrida aceita,
         //          então NÃO bloqueiam frases fortes de embarque (Cheguei, A caminho, Iniciar corrida...), só os sinais fracos.
-        let remnants = classifyOfferCardRemnants(upper: upper, normalizedUpper: normalizedUpper, cardLines: cardLines)
-        if remnants == .hard {
+        //  Exceção: o mapa ocioso da 99 ("Solicitações (5) ... Mais >" + "Buscando") SEM preço nem trajeto é só o rádio vazio → vale como tela ociosa.
+        let isCollapsedListOnly = isIdle && !hasPriceOnScreen && !hasListStepsOnScreen
+        if remnants == .hard && !isCollapsedListOnly {
             acceptedHitCount = 0
             return
         }
@@ -696,16 +751,27 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                 ("CANCELAR CORRIDA", "Cancelar corrida")
             ]
 
+            // Frases que também aparecem em conversas/redes sociais ("cheguei!", "deslize para...") valem só 1 ponto
+            // e SOMENTE se a tela também tiver texto de app de corrida (passageiro, corrida, viagem, Uber, 99...).
+            let ambiguousPatterns: Set<String> = [
+                "CHEGUEI", "VOCE CHEGOU", "DESLIZE PARA", "ENCONTRAR COM", "ENCONTRO COM", "INDO ATE", "INDO BUSCAR",
+                "PEGAR PASSAGEIRO", "FALAR COM PASSAGEIRO", "EMBARQUE EM ", "ATE O EMBARQUE"
+            ]
+            let driverContext = hasDriverContext(normalizedUpper)
+
             for item in highConfidencePhrases {
                 if normalizedUpper.contains(item.pattern) {
+                    let ambiguous = ambiguousPatterns.contains(item.pattern)
+                    if ambiguous && !driverContext { continue }
                     matchedReason = item.label
-                    confidenceWeight = 2
+                    confidenceWeight = ambiguous ? 1 : 2
                     break
                 }
             }
 
-            // Sinais fracos (navegação genérica) só valem com a tela 100% limpa de card
-            if matchedReason == nil && remnants == .none {
+            // Sinais fracos (navegação genérica) só valem com a tela 100% limpa de card E com texto de app de corrida
+            // (Google Maps/Waze/Instagram também têm "Vire à direita", "km/h", "Navegar"...)
+            if matchedReason == nil && remnants == .none && driverContext {
                 let navPhrases: [(pattern: String, label: String)] = [
                     ("EMBARQUE", "Tela de embarque"),
                     ("A CAMINHO", "A caminho"),
@@ -744,7 +810,7 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
             }
 
             // SINAL D (tela limpa de card): barra única de tempo/distância até o passageiro, sem preço R$
-            if matchedReason == nil && remnants == .none && elapsed >= 0.8, let pendingOffer = activeOfferPayload {
+            if matchedReason == nil && remnants == .none && driverContext && elapsed >= 0.8, let pendingOffer = activeOfferPayload {
                 let (_, _, totalKm, _, _, totalMin, stepCount) = extractStructuredSteps(from: allScreenText)
                 if stepCount == 1 && totalKm > 0 && totalMin > 0 && totalMin <= max(pendingOffer.pickupMinutes + 6, 15) {
                     matchedReason = "Barra de deslocamento até embarque (\(totalMin) min)"
@@ -1062,7 +1128,38 @@ public final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable 
                normalizedUpper.contains("INSTAGRAM") ||
                normalizedUpper.contains("TELEGRAM") ||
                normalizedUpper.contains("BUSCAR APPS") ||
-               normalizedUpper.contains("BIBLIOTECA DE APPS")
+               normalizedUpper.contains("BIBLIOTECA DE APPS") ||
+               normalizedUpper.contains("CONVERSAS") ||
+               normalizedUpper.contains("COMUNIDADES") ||
+               normalizedUpper.contains("REELS") ||
+               normalizedUpper.contains("STORIES") ||
+               normalizedUpper.contains("SEGUIDORES") ||
+               normalizedUpper.contains("YOUTUBE") ||
+               normalizedUpper.contains("TIKTOK") ||
+               normalizedUpper.contains("FACEBOOK") ||
+               normalizedUpper.contains("SPOTIFY") ||
+               normalizedUpper.contains("SAFARI")
+    }
+
+    /// A tela cita palavras próprias de app de corrida (Uber/99). Telas de chat, redes sociais, Maps etc. normalmente não têm.
+    private func hasDriverContext(_ normalizedUpper: String) -> Bool {
+        let range = NSRange(normalizedUpper.startIndex..<normalizedUpper.endIndex, in: normalizedUpper)
+        return normalizedUpper.contains("UBER") ||
+               Self.standalone99Regex.firstMatch(in: normalizedUpper, options: [], range: range) != nil ||
+               normalizedUpper.contains("PASSAGEIRO") ||
+               normalizedUpper.contains("CORRIDA") ||
+               normalizedUpper.contains("VIAGEM") ||
+               normalizedUpper.contains("MOTORISTA") ||
+               normalizedUpper.contains("EMBARQUE")
+    }
+
+    /// A tela parece um card de oferta (preço + trajeto + botão), mesmo que o parser não tenha conseguido montá-lo.
+    private func looksLikeOfferScreen(_ normalizedUpper: String) -> Bool {
+        let hasMoney = normalizedUpper.contains("R$") || normalizedUpper.contains("RS ")
+        let hasTrip = normalizedUpper.contains("KM") && normalizedUpper.contains("MIN")
+        let hasButton = normalizedUpper.contains("ACEITAR") || normalizedUpper.contains("NEGOCIA") ||
+                        normalizedUpper.contains("PGTO") || normalizedUpper.contains("CORRIDAS")
+        return hasMoney && hasTrip && hasButton
     }
 
     /// Extrai a rua de embarque e palavras-chave significativas do embarque e do destino
